@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/system-thoughts/perf-tests",
+  "commit": "0e6f8eb506f7b1791ddf10306b3749582a3ce4e8",
+  "source_directory": "tools/proxy-bench/fixed-pool/tests",
+  "files": {
+    "source.py": "1ca4b7727f9cafbec573a32e720c2402ea3260c4cb18f2e8533bd6d2a875ea7e",
+    "deploy.py": "c01e75848c4b3e7e82d7bc4b9e2771d57b61774a4e851d51dc1befa501651821",
+    "multi_worker.py": "47322456d1d4f50257d59edc2a6613553c3c5008e4c961ddf77db404e382ae7d",
+    "integration.py": "11d5ab7d97c75b9cad148918bb6e01e22eb917cd667e87b7e4e48d41f2a6ec05",
+    "preparation.py": "93d2611e5cc1bb40e9891b8fb1fc4360faeb3d5cfe5878bd65283d9ef002c91d",
+    "README.md": "07312c74cf516f674e59519951caeb21bacd0facb3f4b30f6b44edbe8d885c1b"
+  },
+  "purpose": "Unmodified import for provenance; subsequent commits adapt the active tests to an external checkout."
+}
