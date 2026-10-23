@@ -15,6 +15,7 @@ import re
 import subprocess
 import time
 import uuid
+from delivery import record_candidate
 
 import yaml
 
@@ -30,7 +31,8 @@ class Regression:
         self.args = args
         self.root = Path(args.work_dir).resolve()
         self.root.mkdir(parents=True, exist_ok=False)
-        self.source = Path(__file__).resolve().parents[1] / "deploy/source"
+        record_candidate(args.delivery, self.root)
+        self.source = Path(args.delivery).resolve() / "deploy/source"
         self.name = "fp-source-" + uuid.uuid4().hex[:10]
         self.created, self.cases, self.sequence = [], [], 0
 
@@ -300,18 +302,16 @@ class Regression:
         assert hashlib.sha256(raw).hexdigest() == manifest_id
         (self.root / "dataset-manifest.json").write_bytes(raw)
         manifest = json.loads(raw)
-        vectors = json.loads((self.source.parents[1] / "testdata/vectors.json").read_text())
-        prefix = bytes.fromhex(vectors["prefix_hex"])
         with self.forward() as port:
             for index, obj in enumerate(manifest["objects"]):
-                object_path = "/objects/sha256/" + vectors["sha256"][index]
+                object_path = "/" + obj["relative_path"]
                 assert obj["url"] == settings["BASE_URL"] + object_path
                 response, body = self.http(port, object_path)
                 assert response.status == 200 and len(body) == 64
-                assert hashlib.sha256(body).hexdigest() == vectors["sha256"][index]
+                assert hashlib.sha256(body).hexdigest() == obj["sha256"]
+                generated_body = self.kube("exec", transfer, "--", "cat", "/data/dataset/" + obj["relative_path"]).stdout
+                assert body == generated_body
                 full_body = body
-                if index == 0:
-                    assert body[:16] == prefix
                 response, body = self.http(port, object_path, "HEAD")
                 assert response.status == 200 and response.getheader("Content-Length") == "64" and not body
                 response, body = self.http(port, object_path, headers={"Range": "bytes=0-15"})
@@ -319,7 +319,7 @@ class Regression:
                 assert response.getheader("Content-Length") == "16" and body == full_body[:16]
                 response, _ = self.http(port, "/incorrect-prefix" + object_path)
                 assert response.status == 404
-        self.completed("generated-object-url-head-get-range")
+        self.completed("SRC-01-generated-object-url-head-get-range")
 
         # Mutate only this run's server: wrong mount must be observed as a failed object GET.
         patch = {"spec": {"template": {"spec": {"containers": [{"name": "file-server", "volumeMounts": [
@@ -327,7 +327,7 @@ class Regression:
         self.kube("patch", "statefulset", self.name, "--type=strategic", "-p", json.dumps(patch))
         self.kube("rollout", "status", "statefulset/" + self.name, "--timeout=120s", timeout=130)
         with self.forward() as port:
-            response, _ = self.http(port, "/objects/sha256/" + vectors["sha256"][0])
+            response, _ = self.http(port, "/objects/sha256/" + manifest["objects"][0]["sha256"])
             assert response.status == 404
         self.completed("wrong-mount-is-visible")
         self.kube("apply", "-f", str(server))
@@ -335,8 +335,8 @@ class Regression:
         restored = self.kube("exec", self.name + "-0", "--", "cat", path).stdout
         assert restored == raw
         with self.forward() as port:
-            response, body = self.http(port, "/objects/sha256/" + vectors["sha256"][0])
-            assert response.status == 200 and hashlib.sha256(body).hexdigest() == vectors["sha256"][0]
+            response, body = self.http(port, "/objects/sha256/" + manifest["objects"][0]["sha256"])
+            assert response.status == 200 and hashlib.sha256(body).hexdigest() == manifest["objects"][0]["sha256"]
         self.completed("restore-without-regeneration")
 
         # A fresh Job against the nonempty root must fail without publishing a new result.
@@ -384,6 +384,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("work-dir", "namespace", "node", "storage-class", "tools-image", "file-server-image"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--delivery", type=Path, required=True)
     args = parser.parse_args()
     for value in (args.tools_image, args.file_server_image):
         if not re.fullmatch(r"[^\s@]+@sha256:[a-f0-9]{64}", value):

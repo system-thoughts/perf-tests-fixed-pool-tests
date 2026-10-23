@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from delivery import record_candidate
 
 import yaml
 
@@ -96,5 +97,7 @@ def validate(root, output):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--work-dir', required=True)
+    parser.add_argument("--delivery", type=Path, required=True)
     args = parser.parse_args()
-    validate(Path(__file__).resolve().parents[1] / 'deploy', Path(args.work_dir))
+    validate(args.delivery.resolve() / 'deploy', Path(args.work_dir))
+    record_candidate(args.delivery, Path(args.work_dir))

@@ -58,7 +58,9 @@ class Preparation(Regression):
 
     def execute(self):
         settings, (pvc, job, server) = self.render()
-        settings.update(B=str(4 * 1024**2), N='2', BASE_URL=self.args.source_base_url,
+        # Keep a reused NodePort from reusing an earlier run's Seed cache.
+        mount = '/usr/share/nginx/html/' + self.name + '/objects'
+        settings.update(B=str(4 * 1024**2), N='2', BASE_URL=self.args.source_base_url.rstrip('/') + '/' + self.name,
                         R='65536', W='2', PREPARATION_NAME='prepare-001',
                         PREPARE_CPU_REQUEST='100m', PREPARE_CPU_LIMIT='2',
                         PREPARE_MEMORY_REQUEST='128Mi', PREPARE_MEMORY_LIMIT='512Mi',
@@ -83,6 +85,7 @@ class Preparation(Regression):
         resources = list(yaml.safe_load_all(server.read_text()))
         resources[0]['spec']['type'] = 'NodePort'
         resources[0]['spec']['ports'][0]['nodePort'] = self.args.source_node_port
+        resources[1]['spec']['template']['spec']['containers'][0]['volumeMounts'][0]['mountPath'] = mount
         server.write_text(yaml.safe_dump_all(resources))
         self.create(server)
         self.kube('rollout', 'status', 'statefulset/' + self.name, '--timeout=120s', timeout=130)
@@ -115,6 +118,23 @@ class Preparation(Regression):
         assert reused['reused'] is True and reused['plan'] == plan['plan']
         self.completed('plan-job-keyed-output-and-reuse')
 
+        # SRC-02 observes the failure through the real preparation command,
+        # before this new origin URL can have populated the Seed cache.
+        patch = {'spec': {'template': {'spec': {'containers': [{'name': 'file-server', 'volumeMounts': [
+            {'name': 'source', 'mountPath': mount, 'subPath': 'dataset', 'readOnly': True}]}]}}}}
+        self.kube('patch', 'statefulset', self.name, '--type=strategic', '-p', json.dumps(patch))
+        self.kube('rollout', 'status', 'statefulset/' + self.name, '--timeout=120s', timeout=130)
+        bad = {**values, 'PREPARATION_NAME': 'wrong-source'}
+        failed_job = self.prepare('seed', bad, self.name + '-wrong-source', success=False)
+        failed = self.read_result(first, failed_job)
+        assert failed['status'] != 'ready', failed
+        evidence = json.loads(self.kube('exec', first, '--', 'cat',
+                              '/inputs/preparations/wrong-source/target-object-results.json').stdout)
+        assert any(o['error'] and o['error']['stage'] == 'full_get' for o in evidence['objects'])
+        self.kube('apply', '-f', str(server))
+        self.kube('rollout', 'status', 'statefulset/' + self.name, '--timeout=120s', timeout=130)
+        self.completed('SRC-02-wrong-source-is-located-by-preparation')
+
         seed_job = self.prepare('seed', values, self.name + '-seed')
         ready = self.read_result(first, seed_job)
         assert ready['status'] == 'ready' and ready['errors'] == []
@@ -126,7 +146,7 @@ class Preparation(Regression):
         failed_job = self.prepare('seed', values, self.name + '-seed-conflict', success=False)
         failed = self.read_result(first, failed_job)
         assert failed['status'] != 'ready' and any(e['code'] == 'DATA_CONFLICT' for e in failed['errors'])
-        self.completed('seed-job-ready-evidence-and-output-conflict')
+        self.completed('PREP-01-real-Seed-ready-and-consumable-evidence')
 
         _, second = slots[1]
         self.upload(second, bundle / 'plans' / key, '/inputs/plans')
@@ -173,7 +193,7 @@ class Preparation(Regression):
             assert worker['worker_id'] == index and worker['rate'] == 2, worker
             pod = self.pod_for_job(name)
             assert pod['status']['containerStatuses'][0]['restartCount'] == 0
-        self.completed('two-worker-jobs-consume-independent-readonly-metadata')
+        self.completed('MULTI-01-real-jobs-consume-independent-readonly-metadata')
 
 
 def main():
@@ -182,6 +202,7 @@ def main():
                 'worker-image', 'source-base-url', 'proxy', 'expected-server-ip', 'instance-ref'):
         parser.add_argument('--' + key, required=True)
     parser.add_argument('--source-node-port', type=int, required=True)
+    parser.add_argument("--delivery", type=Path, required=True)
     args = parser.parse_args()
     for value in (args.tools_image, args.file_server_image, args.worker_image):
         if not re.fullmatch(r'[^\s@]+@sha256:[a-f0-9]{64}', value):

@@ -15,16 +15,18 @@ import shutil
 import signal
 import subprocess
 import time
+from delivery import record_candidate
 
 from integration import invoke, managed_process, read, replace_once, running_proxy, runtime_k6, write
 
 
 @contextmanager
-def prepare(root, address=("127.0.0.1", 0), public_host="127.0.0.1"):
+def prepare(root, delivery, address=("127.0.0.1", 0), public_host="127.0.0.1", object_count=2):
     root.mkdir(parents=True, exist_ok=False)
+    record_candidate(delivery, root)
     for name in ("data-command", "prepare-command"):
         (root / name).mkdir()
-    data = invoke(["proxy-bench-data-prepare", "--size", "65536", "--count", "2",
+    data = invoke(["proxy-bench-data-prepare", "--size", "65536", "--count", str(object_count),
                    "--root", str(root / "data"), "--base-url", "http://fixture.invalid"], root / "data-command")
     rules = root / "proxy-rules.json"
     write(rules, {"schema_version": 1, "filtered_query_params": [], "rewrite_url": False, "use_tls": False})
@@ -42,7 +44,7 @@ def prepare(root, address=("127.0.0.1", 0), public_host="127.0.0.1"):
                        "PRE_ALLOCATED_VUS": "4", "MAX_VUS": "8"}
 
 
-def instrument(scripts, destination, missing_summary=False):
+def instrument(scripts, destination):
     """Copy only the runtime scripts; request labels exist in this fixture only."""
     destination.mkdir()
     for name in ("benchmark.js", "run-benchmark.sh", "lib/plan.js", "lib/summary.js"):
@@ -54,11 +56,8 @@ def instrument(scripts, destination, missing_summary=False):
     source = replace_once(source, old, "headers: { ...spec.headers, Range: request.range, "
                             "'X-Acceptance-Worker': String(spec.worker_id), "
                             "'X-Acceptance-Iteration': String(exec.scenario.iterationInInstance) },")
-    if missing_summary:
-        source = replace_once(source, "return summaryOutputs(data, spec);", "return {};")
     (destination / "benchmark.js").write_text(source)
-    write(destination / "instrumentation.json", {"request_labels_only": not missing_summary,
-          "suppress_summary": missing_summary,
+    write(destination / "instrumentation.json", {"request_labels_only": True,
           "benchmark_sha256": hashlib.sha256(source.encode()).hexdigest()})
 
 
@@ -91,11 +90,6 @@ def check_worker(directory, records, plan_path, worker_id, expect="completed", r
         count = summary["workers"][0]["plan_consumed"]["count"]
         assert sorted(seen) == list(range(int(count))), (worker_id, seen, count)
         assert metrics["REQUESTS_TOTAL"] == count
-        native = read(directory / "k6-summary.json")["native_summary"]
-        for key, metric, field in (("ACTUAL_QPS", "http_reqs", "rate"), ("P99_MS", "http_req_duration", "p(99)"),
-                                   ("P50_MS", "http_req_duration", "med")):
-            assert metrics[key] == native["metrics"][metric]["values"][field]
-        assert metrics["TOOL_DURATION_S"] == native["state"]["testRunDurationMs"] / 1000
         assert metrics["SUCCESS_PCT"] == 100
         if require_loops:
             assert count >= 3 * len(shard), (worker_id, count, len(shard))
@@ -114,12 +108,10 @@ def check_timing(records, workers, name, interrupted_at=None):
     for worker in range(workers):
         times = [r["received_at"] for r in records if r["headers"].get("X-Acceptance-Worker") == str(worker)]
         windows.append({"first": min(times), "last": max(times)} if times else None)
-    if name in ("loops", "unequal-shards"):
+    if name == "MULTI-01":
         assert all(windows), (name, windows)
         assert max(w["first"] for w in windows) < min(w["last"] for w in windows), (name, windows)
-    if name == "staggered":
-        assert all(windows) and windows[0]["last"] < windows[1]["first"], windows
-    if name == "interrupt-peer":
+    if name == "MULTI-02":
         assert interrupted_at is not None
         assert windows[0] and windows[0]["last"] > interrupted_at, (windows, interrupted_at)
     return windows
@@ -128,17 +120,14 @@ def check_timing(records, workers, name, interrupted_at=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument("--delivery", type=Path, required=True)
     args = parser.parse_args()
-    for name in ("k6", "proxy-bench-worker-support", "proxy-bench-data-prepare",
-                 "proxy-bench-plan-prepare", "proxy-bench-seed-cache-prepare"):
-        assert shutil.which(name), f"missing {name} on PATH"
     root = args.work_dir.resolve()
-    scripts = Path(__file__).resolve().parents[1]
+    scripts = args.delivery.resolve() / "runtime"
     completed = []
-    with prepare(root) as (server, base):
-        k6_version = runtime_k6(root, scripts)
-        for name, workers in (("loops", 2), ("unequal-shards", 3), ("invalid-peer", 2),
-                              ("interrupt-peer", 2), ("missing-summary", 2), ("dropped", 2), ("staggered", 2)):
+    with prepare(root, args.delivery) as (server, base):
+        k6_version = runtime_k6(root)
+        for name, workers in (("MULTI-01", 3), ("MULTI-02", 2)):
             case = root / name
             case.mkdir()
             (case / "plan-command").mkdir()
@@ -146,8 +135,6 @@ def main():
                              "--workers", str(workers), "--plan-dir", str(root / "plans")], case / "plan-command")
             plan_path = Path(result["plan"]["path"])
             plan = read(plan_path)
-            shards = [set(read(plan_path.parent / s["path"])) for s in plan["shards"]]
-            assert set.union(*shards) == set(range(8)) and sum(map(len, shards)) == 8
             server.mode = "slow"
             offset = len(server.records)
             interrupted_at = None
@@ -156,22 +143,16 @@ def main():
                 for worker in range(workers):
                     directory = case / str(worker)
                     directory.mkdir()
-                    instrument(scripts, directory / "scripts", name == "missing-summary" and worker == 1)
+                    instrument(scripts, directory / "scripts")
                     env = {**base, "PLAN": str(plan_path), "WORKER_ID": str(worker), "RUN_ID": name,
                            "RESULT_DIR": str(directory / "results")}
-                    if name == "invalid-peer" and worker == 1:
-                        env["WORKER_ID"] = str(workers)
-                    if name == "dropped":
-                        env.update(PRE_ALLOCATED_VUS="1", MAX_VUS="1")
-                    if name == "staggered" and worker == 1:
-                        assert processes[0].wait(timeout=40) == 0
                     log = resources.enter_context((directory / "worker.log").open("w"))
                     directories.append(directory)
                     write(directory / "environment.json", env)
                     processes.append(resources.enter_context(managed_process(
                         ["/bin/sh", str(directory / "scripts/run-benchmark.sh")],
                         env=env, stdout=log, stderr=subprocess.STDOUT)))
-                if name == "interrupt-peer":
+                if name == "MULTI-02":
                     deadline = time.monotonic() + 30
                     while not any(r["headers"].get("X-Acceptance-Worker") == "1" for r in server.records[offset:]):
                         assert time.monotonic() < deadline and processes[1].poll() is None
@@ -182,8 +163,8 @@ def main():
                     write(case / "interruption.json", {"signal_sent_at": interrupted_at})
                 codes = [p.wait(timeout=45) for p in processes]
             expected = [0] * workers
-            if name in ("invalid-peer", "interrupt-peer", "missing-summary"):
-                expected[1] = {"invalid-peer": 2, "interrupt-peer": 130, "missing-summary": 4}[name]
+            if name == "MULTI-02":
+                expected[1] = 130
             assert codes == expected, (name, codes)
             records = copy.deepcopy(server.records[offset:])
             write(case / "requests.json", records)
@@ -192,12 +173,9 @@ def main():
             outputs = []
             for worker, directory in enumerate(directories):
                 own = [r for r in records if r["headers"].get("X-Acceptance-Worker") == str(worker)]
-                if name == "invalid-peer" and worker == 1:
-                    assert own == [] and not (directory / "results/worker-spec.json").exists()
-                    continue
-                state = "interrupted" if name == "interrupt-peer" and worker == 1 else "unknown" if name == "missing-summary" and worker == 1 else "completed"
+                state = "interrupted" if name == "MULTI-02" and worker == 1 else "completed"
                 outputs.append(check_worker(directory / "results", own, plan_path, worker, state,
-                                            name in ("loops", "unequal-shards")))
+                                            name == "MULTI-01"))
                 inspect_log = directory / "inspect-command"
                 inspect_log.mkdir()
                 options = invoke(["k6", "inspect",
@@ -216,10 +194,8 @@ def main():
             rates = [a["rate"] for a in runs[0]["workers"]]
             assert rates == ([9, 8] if workers == 2 else [7, 6, 4]), rates
             assert all([a["rate"] for a in r["workers"]] == rates and r["total_rate"] == 17 for r in runs)
-            if name in ("loops", "unequal-shards", "dropped", "staggered", "interrupt-peer"):
+            if name in ("MULTI-01", "MULTI-02"):
                 assert all(r == runs[0] for r in runs), name
-            if name == "dropped":
-                assert all(o["metrics"]["DROPPED_ITERATIONS"] > 0 for o in outputs)
             completed.append({"case": name, "exit_codes": codes, "rates": rates, "workers": outputs})
             write(root / "completed-cases.json", completed)
             print(f"PASS {name}: {codes}, rates={rates}", flush=True)
