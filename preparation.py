@@ -138,6 +138,7 @@ class Preparation(Regression):
         seed_job = self.prepare('seed', values, self.name + '-seed')
         ready = self.read_result(first, seed_job)
         assert ready['status'] == 'ready' and ready['errors'] == []
+        assert ready['method'] == 'http-full-body-and-finished-v1', ready
         (bundle / 'preparations').mkdir()
         prep = values['PREPARATION_NAME']
         self.kube('cp', first + ':/inputs/preparations/' + prep, str(bundle / 'preparations' / prep))

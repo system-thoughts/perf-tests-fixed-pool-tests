@@ -94,14 +94,19 @@ Kubernetes scenarios. They exercise required commands, paths and permissions as
 part of the source/plan/Seed/worker flow; no separate packaging suite is maintained.
 Retained full-set acceptance checks all relevant boundaries.
 
-The controlled PREP variants have separate observations:
+The controlled PREP variants have separate observations. Concurrency is counted
+before responses become visible; callback cleanup can outlive a client request.
 
 | Subcase | Name | Evidence |
 | --- | --- | --- |
 | PREP-01-P01 | Five objects respect concurrency two and the explicit proxy | concurrent.stdout, result.json |
-| PREP-01-P02 | A false final completion marker prevents ready | final-marker.stdout |
+| PREP-01-P02 | Complete data is ready without a task-finished marker; no polling | marker-absent.stdout |
 | PREP-01-P03 | Distinct objects cannot share one task | shared-task.stdout |
 | PREP-01-P04 | SIGTERM cannot publish ready | cancelled.stdout |
+| PREP-01-P05 | A bad final Range prevents ready | final-range.stdout |
+| PREP-01-P06 | Transient loss recovers; other workers dispatch; no full GET replay | transport-result.json |
+| PREP-01-P07 | Persistent loss is bounded; skipped objects identify stop cause | *-reset-persistent.stdout |
+| PREP-01-P08 | Shared timeout bounds backoff; full GET is not retried | transport-result.json |
 
 RUN-01 has normal and dropped variants; their result directories identify the
 variant. The PREP protocol fixtures do not replace PREP-01 against a real Seed.
