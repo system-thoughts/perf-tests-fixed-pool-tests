@@ -176,6 +176,18 @@ def runtime_k6(root):
     return version.stdout.strip()
 
 
+def worker_records(path):
+    """Read the worker's log records without reconstructing a derived report."""
+    records = {}
+    prefix = "PROXY_BENCH_FIXED_POOL_"
+    for line in Path(path).read_text().splitlines():
+        if line.startswith(prefix):
+            kind, value = line[len(prefix):].split(" ", 1)
+            assert kind not in records, f"duplicate log record: {kind}"
+            records[kind] = json.loads(value)
+    return records
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, required=True)
@@ -224,11 +236,12 @@ def main():
         def run_case(name, mode="normal", changes=None, instrument=False):
             case = root / name
             case.mkdir()
-            env = {**base, "RUN_ID": name, "RESULT_DIR": str(case / "results"), **(changes or {})}
+            env = {**base, "RUN_ID": name, "TMPDIR": str(case), **(changes or {})}
             workload = scripts
             if instrument:
                 workload = case / "instrumented"
                 shutil.copytree(scripts, workload, ignore=shutil.ignore_patterns("internal", "cmd", "tests", "deploy", "schemas"))
+                shutil.copytree(scripts.parent / "lib", workload.parent / "lib")
                 source = (workload / "benchmark.js").read_text()
                 source = replace_once(source, "headers: { ...spec.headers, Range: request.range },",
                                         "headers: { ...spec.headers, Range: request.range, 'X-Acceptance-Iteration': String(exec.scenario.iterationInInstance), 'X-Acceptance-VU': String(exec.vu.idInTest) },")
@@ -240,14 +253,35 @@ def main():
                 code = process.wait(timeout=45)
             records = copy.deepcopy(server.records[offset:])
             write(case / "requests.json", records)
-            report = read(case / "results/worker-summary.json")
-            native = read(case / "results/k6-summary.json")
-            run = read(case / "results/run-spec.json")
+            logged = worker_records(case / "worker.log")
+            assert set(logged) == {"RUN_SPEC_V1", "WORKER_SPEC_V1", "K6_SUMMARY_V1", "WORKER_EXIT_V1"}
+            native = logged["K6_SUMMARY_V1"]
+            run = logged["RUN_SPEC_V1"]
+            spec = logged["WORKER_SPEC_V1"]
+            execution = logged["WORKER_EXIT_V1"]
             assert "k6_version" not in native and "k6" not in run["tool_versions"]
-            execution = read(case / "results/worker-execution.json")
+            assert execution["exit_code"] == code
+            assert not list(case.glob("proxy-bench-fixed-pool.*")), "temporary input directory leaked"
+            assert not (case / "results").exists(), "worker still requires an archive directory"
             write(case / "invocation.json", {"exit_code": code, "environment": env, "instrumented": instrument})
-            metrics = report["workers"][0]["metrics"]
-            assert report["result_complete"], (name, report)
+            metrics = native["native_summary"]["metrics"]
+            text = (case / "worker.log").read_text()
+            assert "\nproxy-bench (fixed-pool)\n" in text
+            load = next(line for line in text.splitlines() if line.startswith("  Load"))
+            assert "peak" not in load
+            consumed = next(line for line in text.splitlines() if line.startswith("  Consumed"))
+            assert consumed.split() == ["Consumed", str(int(metrics["plan_consumed"]["values"]["count"])),
+                                        "plan", "entries;", "shard", str(spec["region_count"]),
+                                        "regions", "(repeats", "included)"]
+            header = next(line for line in text.splitlines() if line.startswith("  Latency (ms)"))
+            assert header.split()[2:] == ["min", "avg", "med", "p(90)", "p(95)", "p(99)", "max"]
+            assert all(label in text for label in ("  Requests", "  Failed", "  Throughput"))
+            latency = next(line for line in text.splitlines() if line.startswith("    request"))
+            assert latency.split()[1:] == [
+                f"{metrics['http_req_duration']['values'][stat]:.2f}"
+                for stat in native["native_summary"]["options"]["summaryTrendStats"]]
+            result = next(line for line in text.splitlines() if line.startswith("  Result"))
+            assert ("FAILED" if code == 99 else "NOT EVALUATED (no thresholds configured)") in result
             assert native["effective_options"]["scenarios"]["fixed_pool"]["executor"] == "constant-arrival-rate"
             for record in records:
                 assert record["method"] == "GET" and record["version"] == "HTTP/1.1"
@@ -263,29 +297,22 @@ def main():
                     assert record["range"] == f"bytes={start}-{start + plan['range_bytes'] - 1}"
             if instrument:
                 numbers = sorted(int(record["iteration"]) for record in records)
-                count = report["workers"][0]["plan_consumed"]["count"]
+                count = metrics["plan_consumed"]["values"]["count"]
                 assert numbers == list(range(int(count))), (name, numbers, count)
-            results.append({"case": name, "code": code, "requests": len(records), "execution_state": report["execution_state"],
-                            "metrics": metrics, "coverage": report["coverage"], "raw_k6_exit": execution["exit_code"]})
+            results.append({"case": name, "code": code, "requests": len(records),
+                            "metrics": metrics, "raw_k6_exit": execution["exit_code"]})
             write(root / "completed-cases.json", results)
-            return code, report, native, records
+            return code, spec, native, records
 
-        code, report, native, records = run_case("RUN-01", "concurrent",
+        code, spec, native, records = run_case("RUN-01", "concurrent",
                                                {"DURATION": "3s", "TIMEOUT": "5s"}, instrument=True)
         assert code == 0 and len(records) >= 2 * len(shard)
         first = [record for record in records if record["iteration"] in ("0", "1")]
         assert len(first) == 2 and all(record["gate_passed"] for record in first), first
         assert len({int(record["vu"]) for record in first}) == 2, first
         assert max(record["received_at"] for record in first) < min(record["responded_at"] for record in first)
-        required = {"RUN_SPEC_V1", "WORKER_SPEC_V1", "K6_SUMMARY_V1", "WORKER_EXIT_V1", "WORKER_RESULT_V1"}
-        logged = {}
-        prefix = "PROXY_BENCH_FIXED_POOL_"
-        for line in (root / "RUN-01/worker.log").read_text().splitlines():
-            if line.startswith(prefix):
-                kind, value = line[len(prefix):].split(" ", 1)
-                if kind in required:
-                    assert kind not in logged, f"duplicate log record: {kind}"
-                    logged[kind] = json.loads(value)
+        required = {"RUN_SPEC_V1", "WORKER_SPEC_V1", "K6_SUMMARY_V1", "WORKER_EXIT_V1"}
+        logged = worker_records(root / "RUN-01/worker.log")
         assert set(logged) == required, sorted(logged)
         assert all(value["run_id"] == "RUN-01" for value in logged.values())
         assert logged["WORKER_SPEC_V1"]["worker_id"] == 0 and logged["WORKER_SPEC_V1"]["rate"] == 10
@@ -294,30 +321,55 @@ def main():
         assert summary["native_summary"]["metrics"]["http_reqs"]["values"]["count"] > 0
         assert logged["WORKER_EXIT_V1"]["exit_code"] == 0
         assert logged["WORKER_EXIT_V1"]["termination_reason"] == "completed"
-        assert logged["WORKER_RESULT_V1"]["result_complete"]
         write(root / "RUN-01/log-facts.json", {"records": sorted(logged),
               "concurrent_vus": sorted(int(record["vu"]) for record in first), "overlap_confirmed": True})
+        # Coverage is observable from native consumption and shard facts, with
+        # a normal exit and consistent counters. It is not a second result model.
+        counts = summary["native_summary"]["metrics"]
+        consumed = counts["plan_consumed"]["values"]["count"]
+        assert consumed == counts["iterations"]["values"]["count"] == counts["http_reqs"]["values"]["count"]
+        unique = len({int(r["iteration"]) % len(shard) for r in records})
+        assert unique == min(consumed, spec["region_count"])
         original_plan = plan_path.read_bytes()
-        code, report, native, records = run_case("RUN-04", changes={"RATE": "20", "DURATION": "3s"}, instrument=True)
+        code, spec, native, records = run_case("RUN-04-repeat", changes={"DURATION": "3s"}, instrument=True)
+        assert code == 0 and plan_path.read_bytes() == original_plan
+        assert native["effective_options"]["scenarios"]["fixed_pool"]["rate"] == 10
+        code, spec, native, records = run_case("RUN-04", changes={"RATE": "20", "DURATION": "3s", "WORKER_ID": "00"}, instrument=True)
         assert code == 0 and plan_path.read_bytes() == original_plan
         assert native["effective_options"]["scenarios"]["fixed_pool"]["rate"] == 20
-        code, report, native, records = run_case("RUN-03", "wrong-status", instrument=True)
+        code, spec, native, records = run_case("RUN-03", "wrong-status", instrument=True)
         assert code == 0 and native["native_summary"]["metrics"]["http_req_failed"]["values"]["rate"] == 1
-        code, report, native, records = run_case("RUN-01-dropped", "slow",
+        code, spec, native, records = run_case("RUN-01-dropped", "slow",
                                                 {"RATE": "100", "PRE_ALLOCATED_VUS": "1", "MAX_VUS": "1"}, instrument=True)
         assert code == 0 and native["native_summary"]["metrics"]["dropped_iterations"]["values"]["count"] > 0
         config_home = root / "config-home"
         (config_home / "k6").mkdir(parents=True)
         write(config_home / "k6/config.json", {"thresholds": {"http_req_failed": ["rate<0"]}})
-        code, report, native, _ = run_case("TERM-01", changes={"XDG_CONFIG_HOME": str(config_home)})
-        assert code == 3 and results[-1]["raw_k6_exit"] == 99
+        code, spec, native, _ = run_case("TERM-01", changes={"XDG_CONFIG_HOME": str(config_home)})
+        assert code == 99 and results[-1]["raw_k6_exit"] == 99
         assert native["effective_options"]["thresholds"]["http_req_failed"] == ["rate<0"]
+
+        # An engine configuration error can occur before handleSummary. Keep
+        # the native failure and available facts without synthesizing a summary.
+        case = root / "TERM-01-startup"
+        case.mkdir()
+        env = {**base, "RUN_ID": "TERM-01-startup", "TMPDIR": str(case), "K6_MAX_REDIRECTS": "invalid"}
+        with (case / "worker.log").open("w") as log:
+            process = run_command(["/bin/sh", str(scripts / "run-benchmark.sh")], env=env,
+                                  stdout=log, stderr=subprocess.STDOUT, timeout=45)
+        logged = worker_records(case / "worker.log")
+        assert process.returncode != 0 and logged["WORKER_EXIT_V1"]["exit_code"] == process.returncode
+        assert logged["WORKER_EXIT_V1"]["termination_reason"] == "failed"
+        assert "K6_SUMMARY_V1" not in logged and "WORKER_RESULT_V1" not in logged
+        assert not list(case.glob("proxy-bench-fixed-pool.*"))
+        results.append({"case": "TERM-01-startup", "code": process.returncode, "summary_present": False})
+        write(root / "completed-cases.json", results)
 
         rejected = []
         for name in ("nonready",):
             case = root / "RUN-02"
             case.mkdir()
-            env = {**base, "RUN_ID": "reject-" + name, "RESULT_DIR": str(case / "results")}
+            env = {**base, "RUN_ID": "reject-" + name, "TMPDIR": str(case)}
             prepared = read(root / "target/target-preparation.json")
             shutil.copy(root / "target/target-object-results.json", case / "target-object-results.json")
             prepared["status"] = "failed"
@@ -328,7 +380,7 @@ def main():
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             (case / "worker.log").write_text(completed.stdout)
             assert completed.returncode == 2, (name, completed.stdout)
-            assert len(server.records) == before and not (case / "results/worker-spec.json").exists()
+            assert len(server.records) == before and not list(case.glob("proxy-bench-fixed-pool.*"))
             assert "PROXY_BENCH_FIXED_POOL_ERROR_V1" in completed.stdout
             rejected.append({"case": "RUN-02", "variant": name})
         write(root / "rejected-inputs.json", rejected)

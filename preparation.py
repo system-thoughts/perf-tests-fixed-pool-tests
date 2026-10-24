@@ -170,8 +170,11 @@ class Preparation(Regression):
                       'PLAN_KEY': key, 'HTTP_PROXY': self.args.proxy, 'RATE': '4', 'DURATION': '3s',
                       'WORKER_CPU_REQUEST': '100m', 'WORKER_CPU_LIMIT': '2',
                       'WORKER_MEMORY_REQUEST': '256Mi', 'WORKER_MEMORY_LIMIT': '1Gi'}
-            self.create(self.render_template('worker/worker-job.tpl.yaml', values,
-                                            self.root / (name + '.yaml')))
+            path = self.render_template('worker/worker-job.tpl.yaml', values,
+                                        self.root / (name + '.yaml'))
+            resource = yaml.safe_load(path.read_text())
+            assert resource['spec']['template']['spec']['containers'][0]['securityContext']['readOnlyRootFilesystem'] is True
+            self.create(path)
             jobs.append(name)
         for index, name in enumerate(jobs):
             self.wait_job(name, True)
@@ -183,18 +186,25 @@ class Preparation(Regression):
                     prefix, data = line.split(' ', 1)
                     assert prefix not in records, prefix
                     records[prefix] = json.loads(data)
-            assert len(records) == 5, records.keys()
+            assert len(records) == 4, records.keys()
             for prefix, record in records.items():
                 write(self.root / f'worker-{index}-{prefix}.json', record)
-            summary = records['PROXY_BENCH_FIXED_POOL_WORKER_RESULT_V1']
-            assert summary['result_complete'] and not summary['errors'], summary
-            metrics = summary['workers'][0]['metrics']
-            assert metrics['REQUESTS_TOTAL'] > 0 and metrics['SUCCESS_PCT'] == 100, metrics
+            execution = records['PROXY_BENCH_FIXED_POOL_WORKER_EXIT_V1']
+            assert execution['exit_code'] == 0 and execution['termination_reason'] == 'completed'
+            native = records['PROXY_BENCH_FIXED_POOL_K6_SUMMARY_V1']
+            metrics = native['native_summary']['metrics']
+            assert metrics['http_reqs']['values']['count'] > 0 and metrics['http_req_failed']['values']['rate'] == 0
             worker = records['PROXY_BENCH_FIXED_POOL_WORKER_SPEC_V1']
             assert worker['worker_id'] == index and worker['rate'] == 2, worker
             pod = self.pod_for_job(name)
             assert pod['status']['containerStatuses'][0]['restartCount'] == 0
+            container = pod['spec']['containers'][0]
+            assert container['securityContext']['readOnlyRootFilesystem']
+            assert pod['spec']['securityContext']['runAsUser'] != 0
+            assert any(mount['mountPath'] == '/tmp' for mount in container['volumeMounts'])
+            assert 'NOT EVALUATED (no thresholds configured)' in raw.decode()
         self.completed('MULTI-01-real-jobs-consume-independent-readonly-metadata')
+        self.completed('RUN-01-readonly-root-uses-temporary-volume-and-shared-report')
 
 
 def main():

@@ -61,6 +61,7 @@ def main():
     worker = extract_image(args.worker_image,
                            {'/usr/bin/k6': 'bin/k6',
                             '/usr/local/bin/proxy-bench-worker-support': 'bin/proxy-bench-worker-support',
+                            '/home/k6/lib/.': 'lib',
                             '/home/k6/fixed-pool/.': 'runtime'}, output)
     for source in sorted(deployment.rglob('*')):
         if source.is_file() and (source.suffix == '.yaml' or source.name.endswith('.env.example')

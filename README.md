@@ -111,9 +111,9 @@ before responses become visible; callback cleanup can outlive a client request.
 RUN-01 has normal and dropped variants; their result directories identify the
 variant. The PREP protocol fixtures do not replace PREP-01 against a real Seed.
 The normal variant holds the first two requests at a bounded rendezvous and
-requires two distinct VUs and overlapping requests. It parses the five versioned
+requires two distinct VUs and overlapping requests. It parses the four runtime
 log records, checking the run identity, worker/rate, effective options, native
-request count, exit and complete result. It does not compare five output files
+request count, and raw exit. It does not compare five output files
 field by field. `RUN-01/log-facts.json` records these observations.
 
 IDs classify the capability, not a new execution framework. Variants share the
@@ -169,8 +169,9 @@ SL-01 removes duplicate native-result mapping matrices, exhaustive invalid CLI
 inputs, same-path HTTP faults, staggered peers and repeated multi-worker faults.
 Input details stay in Go units; one external case verifies entrypoint wiring.
 Transport resend remains a dependency-upgrade observation, not a required feature
-regression. The real source/report/metadata cases remain transitional while those
-mechanisms still exist; retire them when SL-02/SL-04 remove their implementations.
+regression. SL-02 retires the derived report/file checks; RUN and MULTI read native metrics
+and execution facts directly from worker.log. Source/metadata cases remain
+transitional until SL-04 removes those deployment mechanisms.
 Retirement must not drop the retained source-to-Seed-to-worker boundary.
 
 The short catalogue above maps primary risks. Legacy deployment assertions in the

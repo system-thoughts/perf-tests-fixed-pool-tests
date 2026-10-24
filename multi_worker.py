@@ -17,7 +17,7 @@ import subprocess
 import time
 from delivery import record_candidate
 
-from integration import invoke, managed_process, read, replace_once, running_proxy, runtime_k6, write
+from integration import invoke, managed_process, read, replace_once, running_proxy, runtime_k6, worker_records, write
 
 
 @contextmanager
@@ -47,6 +47,7 @@ def prepare(root, delivery, address=("127.0.0.1", 0), public_host="127.0.0.1", o
 def instrument(scripts, destination):
     """Copy only the runtime scripts; request labels exist in this fixture only."""
     destination.mkdir()
+    shutil.copytree(scripts.parent / "lib", destination.parent / "lib")
     for name in ("benchmark.js", "run-benchmark.sh", "lib/plan.js", "lib/summary.js"):
         target = destination / name
         target.parent.mkdir(exist_ok=True)
@@ -62,7 +63,8 @@ def instrument(scripts, destination):
 
 
 def check_worker(directory, records, plan_path, worker_id, expect="completed", require_loops=False):
-    spec = read(directory / "worker-spec.json")
+    logged = worker_records(directory / "worker.log")
+    spec = logged["WORKER_SPEC_V1"]
     expected_rates = [9, 8] if read(plan_path)["worker_count"] == 2 else [7, 6, 4]
     assert spec["worker_id"] == worker_id and spec["rate"] == expected_rates[worker_id], spec
     plan = read(plan_path)
@@ -80,27 +82,25 @@ def check_worker(directory, records, plan_path, worker_id, expect="completed", r
         assert record["method"] == "GET" and record["version"] == "HTTP/1.1"
         assert headers["accept-encoding"] == "identity"
         seen.append(k)
-    summary = read(directory / "worker-summary.json")
-    assert summary["execution_state"] == expect, summary
-    own_result = summary["workers"][0]
-    metrics = own_result["metrics"]
-    assert summary["aggregate"] is None and summary["coverage"] is None
+    execution = logged["WORKER_EXIT_V1"]
+    assert execution["termination_reason"] == expect, execution
+    native = logged.get("K6_SUMMARY_V1")
+    metrics = native["native_summary"]["metrics"] if native else None
     if expect == "completed":
-        assert summary["result_complete"] and summary["errors"] == [], summary
-        count = summary["workers"][0]["plan_consumed"]["count"]
+        assert execution["exit_code"] == 0 and native is not None
+        count = metrics["plan_consumed"]["values"]["count"]
         assert sorted(seen) == list(range(int(count))), (worker_id, seen, count)
-        assert metrics["REQUESTS_TOTAL"] == count
-        assert metrics["SUCCESS_PCT"] == 100
+        assert metrics["http_reqs"]["values"]["count"] == count
+        assert metrics["http_req_failed"]["values"]["rate"] == 0
         if require_loops:
             assert count >= 3 * len(shard), (worker_id, count, len(shard))
-            assert own_result["coverage"]["unique_regions"] == len(shard)
-            assert own_result["coverage"]["ratio"] == 1
-    elif expect == "interrupted":
-        assert own_result["coverage"] is None
+            assert len({k % len(shard) for k in seen}) == len(shard)
     else:
-        assert not summary["result_complete"] and own_result["coverage"] is None
+        assert execution["exit_code"] != 0
+    assert not list(directory.glob("proxy-bench-fixed-pool.*")), "temporary input directory leaked"
+    assert not (directory / "results").exists()
     return {"worker_id": worker_id, "state": expect, "metrics": metrics,
-            "wire_requests": len(records), "coverage": own_result["coverage"]}
+            "wire_requests": len(records), "raw_k6_exit": execution["exit_code"]}
 
 
 def check_timing(records, workers, name, interrupted_at=None):
@@ -145,7 +145,7 @@ def main():
                     directory.mkdir()
                     instrument(scripts, directory / "scripts")
                     env = {**base, "PLAN": str(plan_path), "WORKER_ID": str(worker), "RUN_ID": name,
-                           "RESULT_DIR": str(directory / "results")}
+                           "TMPDIR": str(directory)}
                     log = resources.enter_context((directory / "worker.log").open("w"))
                     directories.append(directory)
                     write(directory / "environment.json", env)
@@ -174,23 +174,16 @@ def main():
             for worker, directory in enumerate(directories):
                 own = [r for r in records if r["headers"].get("X-Acceptance-Worker") == str(worker)]
                 state = "interrupted" if name == "MULTI-02" and worker == 1 else "completed"
-                outputs.append(check_worker(directory / "results", own, plan_path, worker, state,
+                outputs.append(check_worker(directory, own, plan_path, worker, state,
                                             name == "MULTI-01"))
-                inspect_log = directory / "inspect-command"
-                inspect_log.mkdir()
-                options = invoke(["k6", "inspect",
-                                  "--env", f"RESULT_DIR={directory / 'results'}",
-                                  str(directory / "scripts/benchmark.js")], inspect_log)
-                executor = options["scenarios"]["fixed_pool"]
-                expected_rate = ([9, 8] if workers == 2 else [7, 6, 4])[worker]
-                assert executor["executor"] == "constant-arrival-rate" and executor["timeUnit"] == "1s", executor
-                assert executor["rate"] == expected_rate, executor
-            runs = [read(d / "results/run-spec.json") for d in directories if (d / "results/run-spec.json").exists()]
+                logged = worker_records(directory / "worker.log")
+                if "K6_SUMMARY_V1" in logged:
+                    executor = logged["K6_SUMMARY_V1"]["effective_options"]["scenarios"]["fixed_pool"]
+                    expected_rate = ([9, 8] if workers == 2 else [7, 6, 4])[worker]
+                    assert executor["executor"] == "constant-arrival-rate" and executor["timeUnit"] == "1s", executor
+                    assert executor["rate"] == expected_rate, executor
+            runs = [worker_records(d / "worker.log")["RUN_SPEC_V1"] for d in directories]
             assert all("k6" not in r["tool_versions"] for r in runs)
-            for directory in directories:
-                summary = directory / "results/k6-summary.json"
-                if summary.exists():
-                    assert "k6_version" not in read(summary)
             rates = [a["rate"] for a in runs[0]["workers"]]
             assert rates == ([9, 8] if workers == 2 else [7, 6, 4]), rates
             assert all([a["rate"] for a in r["workers"]] == rates and r["total_rate"] == 17 for r in runs)
