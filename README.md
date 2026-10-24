@@ -13,6 +13,24 @@ deployment helper. Load the images into local Docker before running `delivery.py
 No source archive or deployment archive is required. The tests do not obtain,
 compile or retain the perf-tests source tree, or maintain a second template copy.
 
+Development builds are published by the fork's
+[publication workflow](https://github.com/system-thoughts/perf-tests/actions/workflows/publish-fixed-pool.yaml).
+Select a successful run for the candidate commit and download its `fixed-pool-<commit>`
+artifact. Extract the downloaded artifact, then verify and unpack its deployment bundle:
+
+```bash
+sha256sum -c SHA256SUMS
+tar -xzf fixed-pool-deploy.tar.gz
+```
+
+`build-info.txt` gives the tools, worker and reused Docker Hub FileServer digest
+references for that build. Use them as `TOOLS_IMAGE`, `WORKER_IMAGE` and
+`FILE_SERVER_IMAGE`; pull the first two into Docker and set
+`DEPLOY_DIR` to the extracted `fixed-pool-deploy/deploy` directory. Kubernetes
+must be able to pull the same image references. The download archive is a transport
+format; `delivery.py` continues to accept a directory. Other matching build sources
+remain usable. The fork publication workflow is separate from upstream release policy.
+
 Use images and deployment material from the same build. The test evidence records
 resolved local image IDs, repository digests, platform and input file hashes.
 A source commit is provenance, not a dependency that tests build themselves.
