@@ -15,7 +15,7 @@ compile or retain the perf-tests source tree, or maintain a second template copy
 
 Development builds are published by the fork's
 [publication workflow](https://github.com/system-thoughts/perf-tests/actions/workflows/publish-fixed-pool.yaml).
-Select a successful run for the candidate commit and download its `fixed-pool-<commit>`
+Select a successful run for the candidate commit and download its `fixed-pool-<branch>-<commit>`
 artifact. Extract the downloaded artifact, then verify and unpack its deployment bundle:
 
 ```bash
@@ -50,7 +50,7 @@ python3 controlled_prepare.py --delivery "$DELIVERY" --work-dir /tmp/fp-prepare-
 python3 deploy.py --delivery "$DELIVERY" --work-dir /tmp/fp-deploy-001
 ```
 
-`delivery.py` copies the three preparation executables from the tools image, and
+`delivery.py` copies the unified preparation executable from the tools image, and
 k6, worker-support and runtime scripts from the worker image. The controlled
 process tests execute those delivered files on a compatible Linux host, without
 Go or a separately installed k6. They do not claim to run inside a container;

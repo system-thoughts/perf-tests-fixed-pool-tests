@@ -22,14 +22,12 @@ def transport_variants(root, server, env):
     config = json.loads(Path(env['TARGET_CONFIG']).read_text())
     respond = Handler.send_response
     outcomes = []
-    for label, final, persistent, budget, full in [
-            ('range-reset-once', False, False, 2000, False),
-            ('range-reset-concurrent', False, False, 5000, False),
-            ('final-reset-once', True, False, 2000, False),
-            ('range-reset-persistent', False, True, 2000, False),
-            ('final-reset-persistent', True, True, 2000, False),
-            ('range-reset-budget', False, True, 50, False),
-            ('full-get-reset', False, True, 2000, True)]:
+    for label, persistent, budget, full in [
+            ('range-reset-once', False, 2000, False),
+            ('range-reset-concurrent', False, 5000, False),
+            ('range-reset-persistent', True, 2000, False),
+            ('range-reset-budget', True, 50, False),
+            ('full-get-reset', True, 2000, True)]:
         concurrent = label == 'range-reset-concurrent'
         config['prepare'] = {'concurrency': 2 if concurrent else 1, 'ready_timeout_ms': budget}
         write(Path(env['TARGET_CONFIG']), config)
@@ -51,7 +49,7 @@ def transport_variants(root, server, env):
                     dispatched.set()
             if is_range:
                 probes[handler.path] = probes.get(handler.path, 0) + 1
-            candidate = (not is_range) if full else (is_range and probes[handler.path] >= (2 if final else 1))
+            candidate = (not is_range) if full else is_range
             if candidate and (persistent or not failures):
                 failures.append(handler.path)
                 first_failed.set()
@@ -67,7 +65,7 @@ def transport_variants(root, server, env):
         offset = len(server.records)
         server.mode = 'normal'
         Handler.send_response = disconnect
-        command = ['proxy-bench-seed-cache-prepare', '--manifest', env['MANIFEST'],
+        command = ['proxy-bench-prepare', 'seed-cache', '--manifest', env['MANIFEST'],
                    '--target-config', env['TARGET_CONFIG'], '--out', str(root / label)]
         try:
             result = subprocess.run(command, capture_output=True, timeout=15)
@@ -80,21 +78,21 @@ def transport_variants(root, server, env):
         full_count = sum(r['range'] is None for r in own)
         if not persistent:
             assert result.returncode == 0 and outcome['status'] == 'ready', outcome
-            assert full_count == 5 and len(own) == 16, own
+            assert full_count == 5 and len(own) == 11, own
             assert b'succeeded after 2 attempts' in result.stderr, result.stderr
             if concurrent:
                 assert progress_observed and all(progress_observed), own
         else:
             assert result.returncode == 3 and outcome['status'] != 'ready', outcome
             assert len(failures) == (1 if full or budget == 50 else 3), failures
-            assert full_count == (5 if final else 1), own
+            assert full_count == 1, own
             evidence = json.loads((root / label / 'target-object-results.json').read_text())['objects']
-            assert evidence[0]['error']['stage'] == ('full_get' if full else 'final_check' if final else 'range_check')
+            assert evidence[0]['error']['stage'] == ('full_get' if full else 'range_check')
             assert evidence[0]['finished_check_at'] is None, evidence[0]
             for entry in evidence[1:]:
                 assert 'not dispatched' in entry['error']['message'], entry
                 assert 'object 0 failed at' in entry['error']['message'], entry
-                assert (entry['full_read_completed_at'] is not None) == final, entry
+                assert entry['full_read_completed_at'] is None, entry
         outcomes.append({'variant': label, 'exit_code': result.returncode, 'status': outcome['status'],
                          'full_get_count': full_count, 'request_count': len(own), 'injected_failures': len(failures),
                          'dispatch_during_recovery': bool(progress_observed) if concurrent else None})
@@ -142,7 +140,7 @@ def main():
         Handler.do_GET = observe
         Handler.send_response = release
         try:
-            command = ['proxy-bench-seed-cache-prepare', '--manifest', env['MANIFEST'],
+            command = ['proxy-bench-prepare', 'seed-cache', '--manifest', env['MANIFEST'],
                        '--target-config', env['TARGET_CONFIG'], '--out', str(root / 'concurrent')]
             result = subprocess.run(command, capture_output=True, timeout=30,
                                     env={**os.environ, "NO_PROXY": "*", "HTTP_PROXY": "http://invalid.invalid:9"})
@@ -151,12 +149,12 @@ def main():
             assert result.returncode == 0 and json.loads(result.stdout)['status'] == 'ready'
             assert maximum == 2, maximum
             own = server.records[offset:]
-            assert len(own) == 15 and sum(r["range"] is None for r in own) == 5
+            assert len(own) == 10 and sum(r["range"] is None for r in own) == 5
         finally:
             Handler.do_GET = original
             Handler.send_response = respond
         # The task marker is a start-state snapshot, not a data-readiness gate.
-        # Exercise the whole command with that header absent in both passes.
+        # Exercise the whole command with that header absent throughout preparation.
         send_header = Handler.send_header
 
         def without_marker(handler, name, value):
@@ -176,14 +174,14 @@ def main():
         assert result.returncode == 0 and outcome['status'] == 'ready', outcome
         assert outcome['method'] == 'http-full-body-and-finished-v1'
         own = server.records[offset:]
-        assert len(own) == 15 and sum(r['range'] is None for r in own) == 5, own
+        assert len(own) == 10 and sum(r['range'] is None for r in own) == 5, own
 
-        # A bad final-pass Range must still prevent publication of ready.
+        # A bad per-object Range must still prevent publication of ready.
         probes = {}
-        def bad_final_range(handler, name, value):
+        def bad_range(handler, name, value):
             if name == 'X-Dragonfly-Task-Download-Finished' and handler.headers.get('Range'):
                 probes[handler.path] = probes.get(handler.path, 0) + 1
-            if name == 'Content-Range' and probes.get(handler.path) == 2:
+            if name == 'Content-Range' and probes.get(handler.path) == 1:
                 value = 'bytes 1-65536/65536'
             return send_header(handler, name, value)
 
@@ -191,7 +189,7 @@ def main():
             return send_header(handler, name, 'shared-task' if name == 'X-Dragonfly-Task-ID' else value)
 
         failures = []
-        for label, injection, stage in [('final-range', bad_final_range, 'final_check'),
+        for label, injection, stage in [('range', bad_range, 'range_check'),
                                         ('shared-task', repeated_task, 'full_get')]:
             command[-1] = str(root / label)
             Handler.send_header = injection

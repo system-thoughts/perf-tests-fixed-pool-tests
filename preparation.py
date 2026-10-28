@@ -3,7 +3,7 @@
 
 Requires PyYAML, envsubst, kubectl and existing immutable tools/worker/nginx
 images. The caller supplies an isolated source NodePort and a real Seed proxy
-with an observed instance reference. Two PVCs exercise independent copies;
+with an expected server IP. Two PVCs exercise independent copies;
 placing them on one node does not establish cross-node storage compatibility.
 """
 import argparse
@@ -11,6 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -89,15 +90,12 @@ class Preparation(Regression):
         server.write_text(yaml.safe_dump_all(resources))
         self.create(server)
         self.kube('rollout', 'status', 'statefulset/' + self.name, '--timeout=120s', timeout=130)
-        rules = bundle / 'proxy-rules.json'
-        write(rules, {'schema_version': 1, 'filtered_query_params': [], 'rewrite_url': False, 'use_tls': False})
         write(bundle / 'target-config.yaml', {'schema_version': 1,
               'target': {'ref': self.name, 'proxy': self.args.proxy,
-                         'expected_server_ip': self.args.expected_server_ip, 'instance_ref': self.args.instance_ref},
-              'proxy_rules_ref': {'path': rules.name, 'sha256': hashlib.sha256(rules.read_bytes()).hexdigest()}})
+                         'expected_server_ip': self.args.expected_server_ip}})
         slots = [self.metadata(index) for index in range(2)]
         for _, pod in slots:
-            for name in ('dataset-manifest.json', 'target-config.yaml', 'proxy-rules.json'):
+            for name in ('dataset-manifest.json', 'target-config.yaml'):
                 self.upload(pod, bundle / name, '/inputs')
                 self.check_copy(pod, name)
         self.completed('source-to-local-to-independent-metadata-volumes')
@@ -105,18 +103,16 @@ class Preparation(Regression):
         values, first = slots[0]
         plan_job = self.prepare('plan', values, self.name + '-plan')
         plan = self.read_result(first, plan_job)
-        assert plan['errors'] == [] and plan['reused'] is False
+        assert plan['errors'] == [] and 'reused' not in plan
         plan_path = self.kube('exec', first, '--', 'jq', '-er', '.plan.path',
                               '/inputs/reports/' + plan_job + '.json').stdout.decode().strip()
-        key = Path(plan_path).parent.name
-        assert plan_path == '/inputs/plans/' + key + '/request-plan.json'
-        (bundle / 'plans').mkdir()
-        self.kube('cp', first + ':/inputs/plans/' + key, str(bundle / 'plans' / key))
-        assert (bundle / 'plans' / key / 'shards' / '1.json').is_file()
-        reused_job = self.prepare('plan', values, self.name + '-plan-reuse')
-        reused = self.read_result(first, reused_job)
-        assert reused['reused'] is True and reused['plan'] == plan['plan']
-        self.completed('plan-job-keyed-output-and-reuse')
+        assert plan_path == '/inputs/plans/request-plan.json'
+        self.kube('cp', first + ':/inputs/plans', str(bundle / 'plans'))
+        assert (bundle / 'plans' / 'shards' / '1.json').is_file()
+        conflict_job = self.prepare('plan', values, self.name + '-plan-conflict', success=False)
+        conflict = self.read_result(first, conflict_job)
+        assert conflict['plan'] is None and conflict['errors'][0]['code'] == 'DATA_CONFLICT'
+        self.completed('plan-job-explicit-output-refuses-existing-results')
 
         # SRC-02 observes the failure through the real preparation command,
         # before this new origin URL can have populated the Seed cache.
@@ -135,6 +131,38 @@ class Preparation(Regression):
         self.kube('rollout', 'status', 'statefulset/' + self.name, '--timeout=120s', timeout=130)
         self.completed('SRC-02-wrong-source-is-located-by-preparation')
 
+        # A real Seed retains object zero when the origin rejects object one.
+        # This fixture changes only the source's Nginx configuration, not Seed state.
+        objects = json.loads(manifest.read_text())['objects']
+        blocked_path = urlsplit(objects[1]['url']).path
+        fault_name = self.name + '-source-fault'
+        fault = self.root / 'source-fault.json'
+        write(fault, {'apiVersion': 'v1', 'kind': 'ConfigMap',
+                     'metadata': {'name': fault_name, 'namespace': self.args.namespace},
+                     'data': {'default.conf': 'server { listen 80; root /usr/share/nginx/html; '
+                              + 'location = ' + blocked_path + ' { return 503; } '
+                              + 'location / { try_files $uri =404; } }'}})
+        self.create(fault)
+        source_patch = {'spec': {'template': {'spec': {
+            'volumes': [{'name': 'source-fault', 'configMap': {'name': fault_name}}],
+            'containers': [{'name': 'file-server', 'volumeMounts': [
+                {'name': 'source-fault', 'mountPath': '/etc/nginx/conf.d/default.conf',
+                 'subPath': 'default.conf', 'readOnly': True}]}]}}}}
+        self.kube('patch', 'statefulset', self.name, '--type=strategic', '-p', json.dumps(source_patch))
+        self.kube('rollout', 'status', 'statefulset/' + self.name, '--timeout=120s', timeout=130)
+        partial = {**values, 'PREPARATION_NAME': 'partial-source'}
+        partial_job = self.prepare('seed', partial, self.name + '-partial-source', success=False)
+        partial_result = self.read_result(first, partial_job)
+        evidence = json.loads(self.kube('exec', first, '--', 'cat',
+                            '/inputs/preparations/partial-source/target-object-results.json').stdout)['objects']
+        assert partial_result['status'] != 'ready' and evidence[0]['status'] == 'ready', evidence
+        assert evidence[1]['status'] != 'ready' and evidence[1]['error']['stage'] == 'full_get', evidence
+        source_patch['spec']['template']['spec']['volumes'] = [{'name': 'source-fault', '$patch': 'delete'}]
+        source_patch['spec']['template']['spec']['containers'][0]['volumeMounts'] = [
+            {'mountPath': '/etc/nginx/conf.d/default.conf', '$patch': 'delete'}]
+        self.kube('patch', 'statefulset', self.name, '--type=strategic', '-p', json.dumps(source_patch))
+        self.kube('rollout', 'status', 'statefulset/' + self.name, '--timeout=120s', timeout=130)
+
         seed_job = self.prepare('seed', values, self.name + '-seed')
         ready = self.read_result(first, seed_job)
         assert ready['status'] == 'ready' and ready['errors'] == []
@@ -147,10 +175,15 @@ class Preparation(Regression):
         failed_job = self.prepare('seed', values, self.name + '-seed-conflict', success=False)
         failed = self.read_result(first, failed_job)
         assert failed['status'] != 'ready' and any(e['code'] == 'DATA_CONFLICT' for e in failed['errors'])
+        origin_log = self.kube('logs', self.name + '-0').stdout
+        (self.root / 'recovery-origin.log').write_bytes(origin_log)
+        assert objects[0]['sha256'].encode() not in origin_log, 'correct cached object unexpectedly refetched'
+        assert objects[1]['sha256'].encode() in origin_log, 'missing object did not use repaired origin'
+        self.completed('PREP-01-partial-cache-recovers-without-clearing-Seed')
         self.completed('PREP-01-real-Seed-ready-and-consumable-evidence')
 
         _, second = slots[1]
-        self.upload(second, bundle / 'plans' / key, '/inputs/plans')
+        self.upload(second, bundle / 'plans', '/inputs')
         self.upload(second, bundle / 'preparations' / prep, '/inputs/preparations')
         hashes = {}
         for path in sorted(bundle.rglob('*')):
@@ -167,7 +200,7 @@ class Preparation(Regression):
             name = run_id + '-' + str(index)
             values = {**slot, 'JOB_NAME': name, 'RUN_ID': run_id, 'WORKER_ID': str(index),
                       'WORKER_NODE': self.args.node, 'WORKER_IMAGE': self.args.worker_image,
-                      'PLAN_KEY': key, 'HTTP_PROXY': self.args.proxy, 'RATE': '4', 'DURATION': '3s',
+                      'RATE': '4', 'DURATION': '3s',
                       'WORKER_CPU_REQUEST': '100m', 'WORKER_CPU_LIMIT': '2',
                       'WORKER_MEMORY_REQUEST': '256Mi', 'WORKER_MEMORY_LIMIT': '1Gi'}
             path = self.render_template('worker/worker-job.tpl.yaml', values,
@@ -210,7 +243,7 @@ class Preparation(Regression):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ('work-dir', 'namespace', 'node', 'storage-class', 'tools-image', 'file-server-image',
-                'worker-image', 'source-base-url', 'proxy', 'expected-server-ip', 'instance-ref'):
+                'worker-image', 'source-base-url', 'proxy', 'expected-server-ip'):
         parser.add_argument('--' + key, required=True)
     parser.add_argument('--source-node-port', type=int, required=True)
     parser.add_argument("--delivery", type=Path, required=True)

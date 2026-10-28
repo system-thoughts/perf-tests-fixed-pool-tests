@@ -186,7 +186,7 @@ class Regression:
         path = self.data_job(name)
         spec = yaml.safe_load(path.read_text())
         args = spec["spec"]["template"]["spec"]["containers"][0]["args"]
-        args[0] = args[0].replace("/usr/local/bin/proxy-bench-data-prepare", "/nonexistent-command")
+        args[0] = args[0].replace("/usr/local/bin/proxy-bench-prepare", "/nonexistent-command")
         path.write_text(json.dumps(spec))
         self.create(path)
         self.wait_job(name, success=False)
@@ -213,7 +213,7 @@ class Regression:
             if items and items[0]["status"]["phase"] == "Running":
                 pod = items[0]["metadata"]["name"]
                 result = self.kube("exec", pod, "--", "/bin/sh", "-ec",
-                                   'test "$(readlink /proc/1/exe)" = /usr/local/bin/proxy-bench-data-prepare; '
+                                   'test "$(readlink /proc/1/exe)" = /usr/local/bin/proxy-bench-prepare; '
                                    'test -d /data/dataset/.fixed-pool-incomplete; kill -TERM 1', check=False)
                 if result.returncode == 0:
                     break
@@ -284,7 +284,7 @@ class Regression:
         assert generated["errors"] == []
         assert generated["generated_objects"] == 2 and generated["generated_bytes"] == 128
         manifest_id = generated["manifest"]["sha256"]
-        assert generated["manifest"]["path"] == f"/data/dataset/manifests/{manifest_id}/dataset-manifest.json"
+        assert generated["manifest"]["path"] == "/data/dataset/dataset-manifest.json"
         self.kube("delete", "job", self.name + "-data", "--wait=true")
         self.create(server)
         self.kube("rollout", "status", "statefulset/" + self.name, "--timeout=120s", timeout=130)
@@ -297,7 +297,7 @@ class Regression:
                              "/data/reports/" + self.name + "-data.json").stdout.decode().strip()
         raw = self.kube("exec", transfer, "--", "cat", returned).stdout
         assert hashlib.sha256(raw).hexdigest() == manifest_id
-        path = f"/fixed-pool-data/manifests/{manifest_id}/dataset-manifest.json"
+        path = "/fixed-pool-data/dataset-manifest.json"
         raw = self.kube("exec", self.name + "-0", "--", "cat", path).stdout
         assert hashlib.sha256(raw).hexdigest() == manifest_id
         (self.root / "dataset-manifest.json").write_bytes(raw)

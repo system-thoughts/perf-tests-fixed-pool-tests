@@ -24,9 +24,8 @@ def settings(root):
                 values[key] = value
     values.update(JOB_NAME='fixed-pool-test-001', TRANSFER_POD_NAME='fixed-pool-transfer',
                   NAMESPACE='benchmark', SOURCE_NODE='source-node', METADATA_NODE='load-node',
-                  WORKER_NODE='load-node', RUN_ID='test-001', PLAN_KEY='a' * 64,
-                  PREPARATION_NAME='prepare-001', BASE_URL='http://source.benchmark.svc.cluster.local',
-                  HTTP_PROXY='http://seed:4001')
+                  WORKER_NODE='load-node', RUN_ID='test-001',
+                  PREPARATION_NAME='prepare-001', BASE_URL='http://source.benchmark.svc.cluster.local')
     for key in ('TOOLS_IMAGE', 'WORKER_IMAGE', 'FILE_SERVER_IMAGE'):
         values[key] = 'example.invalid/fixture@sha256:' + '0' * 64
     return values

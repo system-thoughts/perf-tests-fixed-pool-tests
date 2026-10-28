@@ -54,10 +54,8 @@ def main():
         parser.error('--deploy-dir must contain the matching fixed-pool deployment material')
     output = args.out.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    commands = ('data-prepare', 'plan-prepare', 'seed-cache-prepare')
     tools = extract_image(args.tools_image,
-                          {f'/usr/local/bin/proxy-bench-{name}': f'bin/proxy-bench-{name}'
-                           for name in commands}, output)
+                          {'/usr/local/bin/proxy-bench-prepare': 'bin/proxy-bench-prepare'}, output)
     worker = extract_image(args.worker_image,
                            {'/usr/bin/k6': 'bin/k6',
                             '/usr/local/bin/proxy-bench-worker-support': 'bin/proxy-bench-worker-support',

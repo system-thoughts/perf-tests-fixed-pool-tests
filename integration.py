@@ -197,39 +197,35 @@ def main():
     root.mkdir(parents=True, exist_ok=False)
     record_candidate(args.delivery, root)
     scripts = args.delivery.resolve() / "runtime"
-    for name in ("k6", "proxy-bench-worker-support", "proxy-bench-data-prepare",
-                 "proxy-bench-plan-prepare", "proxy-bench-seed-cache-prepare"):
+    for name in ("k6", "proxy-bench-worker-support", "proxy-bench-prepare"):
         assert shutil.which(name), f"missing {name} on PATH"
     k6_version = runtime_k6(root)
     data_log = root / "data-command"
     data_log.mkdir()
-    data = invoke(["proxy-bench-data-prepare", "--size", "65536", "--count", "2",
+    data = invoke(["proxy-bench-prepare", "data", "--size", "65536", "--count", "2",
                    "--root", str(root / "data"), "--base-url", "http://fixture.invalid"], data_log)
     manifest = Path(data["manifest"]["path"])
     with running_proxy(root / "data") as server:
-        rules_path = root / "proxy-rules.json"
-        write(rules_path, {"schema_version": 1, "filtered_query_params": [], "rewrite_url": False, "use_tls": False})
         proxy_url = f"http://127.0.0.1:{server.server_port}"
         target = {"schema_version": 1, "target": {"ref": "controlled-proxy", "proxy": proxy_url,
-                  "expected_server_ip": "192.0.2.1", "instance_ref": "controlled-fixture-v1"},
-                  "proxy_rules_ref": {"path": "proxy-rules.json", "sha256": hashlib.sha256(rules_path.read_bytes()).hexdigest()}}
+                  "expected_server_ip": "192.0.2.1"}}
         config = root / "target-config.yaml"
         write(config, target)
         plan_log = root / "plan-command"
         plan_log.mkdir()
-        plan_result = invoke(["proxy-bench-plan-prepare", "--manifest", str(manifest), "--range", "16384",
-                              "--plan-dir", str(root / "plans")], plan_log)
+        plan_result = invoke(["proxy-bench-prepare", "plan", "--manifest", str(manifest), "--range", "16384",
+                              "--out", str(root / "plans")], plan_log)
         plan_path = Path(plan_result["plan"]["path"])
         plan = read(plan_path)
         shard = read(plan_path.parent / plan["shards"][0]["path"])
-        objects = read(plan_path.parent / plan["objects_file"]["path"])
+        objects = [o["url"] for o in read(manifest)["objects"]]
         prepare_log = root / "prepare-command"
         prepare_log.mkdir()
-        invoke(["proxy-bench-seed-cache-prepare", "--manifest", str(manifest), "--target-config", str(config),
+        invoke(["proxy-bench-prepare", "seed-cache", "--manifest", str(manifest), "--target-config", str(config),
                 "--out", str(root / "target")], prepare_log)
         base = {"PATH": os.environ["PATH"], "HOME": str(root), "XDG_CONFIG_HOME": str(root / "clean-config"),
                 "MANIFEST": str(manifest), "PLAN": str(plan_path), "TARGET_CONFIG": str(config),
-                "TARGET_PREPARATION": str(root / "target/target-preparation.json"), "HTTP_PROXY": proxy_url,
+                "TARGET_PREPARATION": str(root / "target/target-preparation.json"), "HTTP_PROXY": "http://unused.invalid:9",
                 "RATE": "10", "DURATION": "1s", "TIMEOUT": "1s", "PRE_ALLOCATED_VUS": "2", "MAX_VUS": "4"}
         results = []
 

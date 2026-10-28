@@ -26,17 +26,14 @@ def prepare(root, delivery, address=("127.0.0.1", 0), public_host="127.0.0.1", o
     record_candidate(delivery, root)
     for name in ("data-command", "prepare-command"):
         (root / name).mkdir()
-    data = invoke(["proxy-bench-data-prepare", "--size", "65536", "--count", str(object_count),
+    data = invoke(["proxy-bench-prepare", "data", "--size", "65536", "--count", str(object_count),
                    "--root", str(root / "data"), "--base-url", "http://fixture.invalid"], root / "data-command")
-    rules = root / "proxy-rules.json"
-    write(rules, {"schema_version": 1, "filtered_query_params": [], "rewrite_url": False, "use_tls": False})
     with running_proxy(root / "data", address) as server:
         proxy = f"http://{public_host}:{server.server_port}"
         config = root / "target-config.yaml"
         write(config, {"schema_version": 1, "target": {"ref": "multi-worker-fixture", "proxy": proxy,
-                       "expected_server_ip": "192.0.2.1", "instance_ref": "controlled-v1"},
-                       "proxy_rules_ref": {"path": rules.name, "sha256": hashlib.sha256(rules.read_bytes()).hexdigest()}})
-        invoke(["proxy-bench-seed-cache-prepare", "--manifest", data["manifest"]["path"],
+                       "expected_server_ip": "192.0.2.1"}})
+        invoke(["proxy-bench-prepare", "seed-cache", "--manifest", data["manifest"]["path"],
                 "--target-config", str(config), "--out", str(root / "target")], root / "prepare-command")
         yield server, {"PATH": os.environ["PATH"], "HOME": str(root), "XDG_CONFIG_HOME": str(root / "clean-config"), "MANIFEST": data["manifest"]["path"],
                        "TARGET_CONFIG": str(config), "TARGET_PREPARATION": str(root / "target/target-preparation.json"),
@@ -69,7 +66,7 @@ def check_worker(directory, records, plan_path, worker_id, expect="completed", r
     assert spec["worker_id"] == worker_id and spec["rate"] == expected_rates[worker_id], spec
     plan = read(plan_path)
     shard = read(plan_path.parent / plan["shards"][worker_id]["path"])
-    objects = read(plan_path.parent / plan["objects_file"]["path"])
+    objects = [o["url"] for o in read(Path(spec["manifest"]["path"]))["objects"]]
     seen = []
     for record in records:
         headers = {k.lower(): v for k, v in record["headers"].items()}
@@ -131,8 +128,8 @@ def main():
             case = root / name
             case.mkdir()
             (case / "plan-command").mkdir()
-            result = invoke(["proxy-bench-plan-prepare", "--manifest", base["MANIFEST"], "--range", "16384",
-                             "--workers", str(workers), "--plan-dir", str(root / "plans")], case / "plan-command")
+            result = invoke(["proxy-bench-prepare", "plan", "--manifest", base["MANIFEST"], "--range", "16384",
+                             "--workers", str(workers), "--out", str(case / "plans")], case / "plan-command")
             plan_path = Path(result["plan"]["path"])
             plan = read(plan_path)
             server.mode = "slow"
