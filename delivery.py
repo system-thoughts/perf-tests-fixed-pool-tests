@@ -46,11 +46,11 @@ def main():
     parser.add_argument('--tools-image', required=True)
     parser.add_argument('--worker-image', required=True)
     parser.add_argument('--deploy-dir', type=Path, required=True,
-                        help='matching deploy directory containing source/dataset-job.tpl.yaml')
+                        help='matching deploy directory containing data.yaml')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     deployment = args.deploy_dir.resolve()
-    if not (deployment / 'source/dataset-job.tpl.yaml').is_file():
+    if not (deployment / 'data.yaml').is_file():
         parser.error('--deploy-dir must contain the matching fixed-pool deployment material')
     output = args.out.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -62,8 +62,7 @@ def main():
                             '/home/k6/lib/.': 'lib',
                             '/home/k6/fixed-pool/.': 'runtime'}, output)
     for source in sorted(deployment.rglob('*')):
-        if source.is_file() and (source.suffix == '.yaml' or source.name.endswith('.env.example')
-                                 or source == deployment / 'check-env.sh'):
+        if source.is_file() and source.suffix == '.yaml':
             target = output / 'deploy' / source.relative_to(deployment)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)

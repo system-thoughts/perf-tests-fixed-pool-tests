@@ -19,11 +19,27 @@ from delivery import record_candidate
 
 import yaml
 
-from deploy import render as render_deployment
-
-
 def write(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def option(container, flag, value):
+    container['args'][container['args'].index(flag) + 1] = str(value)
+
+
+def result_json(raw):
+    # CLI emits one compact JSON result line; diagnostics remain separate lines.
+    values = []
+    for line in raw.decode().splitlines():
+        if line.startswith('{'):
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if 'schema_version' in value and 'errors' in value:
+                values.append(value)
+    assert len(values) == 1, raw.decode()
+    return values[0]
 
 
 class Regression:
@@ -32,8 +48,8 @@ class Regression:
         self.root = Path(args.work_dir).resolve()
         self.root.mkdir(parents=True, exist_ok=False)
         record_candidate(args.delivery, self.root)
-        self.source = Path(args.delivery).resolve() / "deploy/source"
-        self.name = "fp-source-" + uuid.uuid4().hex[:10]
+        self.source = Path(args.delivery).resolve() / 'deploy'
+        self.name = 'fp-source-' + uuid.uuid4().hex[:10]
         self.created, self.cases, self.sequence = [], [], 0
 
     def run(self, command, timeout=60, data=None, check=True):
@@ -84,149 +100,81 @@ class Regression:
             time.sleep(1)
         raise TimeoutError(f"Job {name}: inspect Pod scheduling/image/storage events")
 
-    def render(self):
-        settings = dict(line.split("=", 1) for line in
-                        (self.source / "source.env.example").read_text().splitlines()
-                        if line and not line.startswith("#"))
-        settings.update(SOURCE_NAME=self.name, PVC_NAME=self.name,
-                        JOB_NAME=self.name + "-data",
-                        NAMESPACE=self.args.namespace, SOURCE_NODE=self.args.node,
-                        TOOLS_IMAGE=self.args.tools_image, FILE_SERVER_IMAGE=self.args.file_server_image,
-                        PVC_STORAGE_CLASS=self.args.storage_class, PVC_CAPACITY="64Mi", B="64", N="2")
-        settings["BASE_URL"] = f'http://{self.name}.{self.args.namespace}.svc.cluster.local'
-        write(self.root / "settings.json", settings)
-        self.settings = settings
-        paths = []
-        for template in ("pvc.example.yaml", "dataset-job.tpl.yaml", "file-server.tpl.yaml"):
-            path = self.root / template.replace(".tpl", "").replace(".example", "")
-            rendered = render_deployment(self.source.parent, self.source / template, settings)
-            path.write_text(rendered)
-            self.kube("apply", "--dry-run=server", "-f", str(path))
-            paths.append(path)
-        return settings, paths
+    def material(self, name):
+        docs = list(yaml.safe_load_all((self.source / name).read_text()))
+        for doc in docs:
+            doc['metadata']['namespace'] = self.args.namespace
+            if doc['kind'] in ('Job', 'StatefulSet'):
+                doc['spec']['template']['spec']['nodeSelector'] = {'kubernetes.io/hostname': self.args.node}
+        return docs
 
-    def render_template(self, name, settings, output):
-        output.write_text(render_deployment(self.source.parent, self.source.parent / name, settings))
-        self.kube("apply", "--dry-run=server", "-f", str(output))
-        return output
+    def file(self, name, docs):
+        path = self.root / (name + '.yaml')
+        path.write_text(yaml.safe_dump_all(docs, sort_keys=False))
+        return path
 
-    def transfer(self, settings, name):
-        values = {**settings, "TRANSFER_POD_NAME": name}
-        path = self.render_template("metadata/source-transfer-pod.tpl.yaml", values,
-                                    self.root / (name + ".yaml"))
-        self.create(path)
-        self.kube("wait", "--for=condition=Ready", "pod/" + name, "--timeout=120s", timeout=130)
+    def setup(self, size=64, count=2, base_url=None):
+        pvc = self.material('storage.yaml')[0]
+        pvc['metadata']['name'] = self.name
+        pvc['spec']['storageClassName'] = self.args.storage_class
+        pvc['spec']['resources']['requests']['storage'] = '64Mi'
+        self.create(self.file('source-pvc', [pvc]))
+        data = self.material('data.yaml')[0]
+        data['spec']['template']['spec']['volumes'][0]['persistentVolumeClaim']['claimName'] = self.name
+        c = data['spec']['template']['spec']['containers'][0]
+        c['image'] = self.args.tools_image
+        option(c, '--size', size)
+        option(c, '--count', count)
+        option(c, '--base-url', base_url or 'http://' + self.name + '.' + self.args.namespace + '.svc.cluster.local')
+        self.data = data
+        self.server = self.material('file-server.yaml')
+        for doc in self.server:
+            doc['metadata']['name'] = self.name
+        labels = {'app.kubernetes.io/name': self.name}
+        self.server[0]['spec']['selector'] = labels
+        spec = self.server[1]['spec']
+        spec['serviceName'] = self.name
+        spec['selector']['matchLabels'] = labels
+        spec['template']['metadata']['labels'] = labels
+        spec['template']['spec']['volumes'][0]['persistentVolumeClaim']['claimName'] = self.name
+        spec['template']['spec']['containers'][0]['image'] = self.args.file_server_image
+
+    def data_job(self, name):
+        self.data['metadata']['name'] = name
+        return self.file(name, [self.data])
+
+    def files_pod(self, name, claim, mount):
+        # Test-owned access fixture, not a second copy of a product template.
+        pod = {'apiVersion': 'v1', 'kind': 'Pod',
+               'metadata': {'name': name, 'namespace': self.args.namespace},
+               'spec': {'restartPolicy': 'Never', 'automountServiceAccountToken': False,
+                        'nodeSelector': {'kubernetes.io/hostname': self.args.node},
+                        'securityContext': {'runAsNonRoot': True, 'runAsUser': 1000,
+                                            'runAsGroup': 1000, 'fsGroup': 1000,
+                                            'seccompProfile': {'type': 'RuntimeDefault'}},
+                        'containers': [{'name': 'files', 'image': self.args.tools_image,
+                                        'command': ['/bin/sleep', '3600'],
+                                        'securityContext': {'allowPrivilegeEscalation': False,
+                                                            'readOnlyRootFilesystem': True,
+                                                            'capabilities': {'drop': ['ALL']}},
+                                        'volumeMounts': [{'name': 'files', 'mountPath': mount}]}],
+                        'volumes': [{'name': 'files', 'persistentVolumeClaim': {'claimName': claim}}]}}
+        self.create(self.file(name, [pod]))
+        self.kube('wait', '--for=condition=Ready', 'pod/' + name, '--timeout=120s', timeout=130)
         return name
 
-    def report(self, pod, name):
-        raw = self.kube("exec", pod, "--", "cat", "/data/reports/" + name + ".json").stdout
-        (self.root / (name + "-report.json")).write_bytes(raw)
-        return json.loads(raw)
-
-    def data_job(self, name, **changes):
-        settings = {**self.settings, "JOB_NAME": name, **changes}
-        return self.render_template("source/dataset-job.tpl.yaml", settings,
-                                    self.root / (name + ".yaml"))
+    def report(self, name):
+        raw = self.kube('logs', 'job/' + name).stdout
+        (self.root / (name + '.log')).write_bytes(raw)
+        value = result_json(raw)
+        write(self.root / (name + '-result.json'), value)
+        return value
 
     def pod_for_job(self, name):
         items = json.loads(self.kube("get", "pods", "-l",
                                     "batch.kubernetes.io/job-name=" + name, "-o", "json").stdout)["items"]
         assert len(items) == 1, "inspect unexpected replacement Pods"
         return items[0]
-
-    def report_failures(self, transfer, initial_report):
-        # Recreating the original Job must fail at redirection before Go starts.
-        name = self.name + "-data"
-        self.create(self.data_job(name))
-        self.wait_job(name, success=False)
-        log = self.kube("logs", "job/" + name).stdout
-        assert b"Preparing a new fixed dataset" not in log
-        assert self.report(transfer, name) == initial_report
-        self.completed("existing-report-is-not-overwritten")
-
-        # The data root remains writable: only the report mount is read-only.
-        name = self.name + "-readonly-report"
-        path = self.data_job(name)
-        spec = yaml.safe_load(path.read_text())
-        pod = spec["spec"]["template"]["spec"]
-        pod["volumes"].append({"name": "readonly-report", "emptyDir": {}})
-        pod["containers"][0]["volumeMounts"].append(
-            {"name": "readonly-report", "mountPath": "/data/reports", "readOnly": True})
-        path.write_text(json.dumps(spec))
-        self.create(path)
-        self.wait_job(name, success=False)
-        assert b"Preparing a new fixed dataset" not in self.kube("logs", "job/" + name).stdout
-        assert self.kube("exec", transfer, "--", "test", "!", "-e",
-                         "/data/reports/" + name + ".json", check=False).returncode == 0
-        self.completed("report-write-failure-does-not-start-generation")
-
-        # Two test Jobs deliberately collide on one report path. The dataset
-        # already exists, so the single admitted generator reports DATA_CONFLICT.
-        shared = self.name + "-race"
-        names = [shared + "-0", shared + "-1"]
-        for name in names:
-            path = self.data_job(name)
-            spec = yaml.safe_load(path.read_text())
-            for entry in spec["spec"]["template"]["spec"]["containers"][0]["env"]:
-                if entry["name"] == "JOB_NAME":
-                    entry["value"] = shared
-            path.write_text(json.dumps(spec))
-            self.create(path)
-        admitted = 0
-        for name in names:
-            self.wait_job(name, success=False)
-            admitted += b"Preparing a new fixed dataset" in self.kube("logs", "job/" + name).stdout
-        assert admitted == 1, "exclusive report creation admitted more than one generator"
-        report = self.report(transfer, shared)
-        assert report["manifest"] is None and report["errors"][0]["code"] == "DATA_CONFLICT"
-        self.completed("concurrent-report-creation-admits-one-writer")
-
-        # Startup failure leaves an empty reserved report, never a success JSON.
-        name = self.name + "-missing-command"
-        path = self.data_job(name)
-        spec = yaml.safe_load(path.read_text())
-        args = spec["spec"]["template"]["spec"]["containers"][0]["args"]
-        args[0] = args[0].replace("/usr/local/bin/proxy-bench-prepare", "/nonexistent-command")
-        path.write_text(json.dumps(spec))
-        self.create(path)
-        self.wait_job(name, success=False)
-        raw = self.kube("exec", transfer, "--", "cat", "/data/reports/" + name + ".json").stdout
-        assert raw == b""
-        status = self.pod_for_job(name)["status"]["containerStatuses"][0]["state"]["terminated"]
-        assert status["exitCode"] == 127
-        self.completed("startup-failure-empty-report-is-not-success")
-
-    def interrupt_generation(self):
-        # A separate pool leaves the successful source and its report untouched.
-        name = self.name + "-interrupt"
-        pvc = yaml.safe_load((self.root / "pvc.yaml").read_text())
-        pvc["metadata"]["name"] = name
-        pvc["spec"]["resources"]["requests"]["storage"] = "4Gi"
-        path = self.root / (name + "-pvc.json")
-        write(path, pvc)
-        self.create(path)
-        self.create(self.data_job(name, PVC_NAME=name, B=str(4 * 1024**3), N="1"))
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            items = json.loads(self.kube("get", "pods", "-l",
-                                        "batch.kubernetes.io/job-name=" + name, "-o", "json").stdout)["items"]
-            if items and items[0]["status"]["phase"] == "Running":
-                pod = items[0]["metadata"]["name"]
-                result = self.kube("exec", pod, "--", "/bin/sh", "-ec",
-                                   'test "$(readlink /proc/1/exe)" = /usr/local/bin/proxy-bench-prepare; '
-                                   'test -d /data/dataset/.fixed-pool-incomplete; kill -TERM 1', check=False)
-                if result.returncode == 0:
-                    break
-            time.sleep(0.1)
-        else:
-            raise TimeoutError("could not signal the running generator")
-        self.wait_job(name, success=False)
-        status = self.pod_for_job(name)["status"]["containerStatuses"][0]["state"]["terminated"]
-        assert status["exitCode"] == 130, status
-        transfer = self.transfer({**self.settings, "PVC_NAME": name}, name + "-files")
-        report = self.report(transfer, name)
-        assert report["manifest"] is None and any(e["code"] == "INTERRUPTED" for e in report["errors"])
-        self.completed("sigterm-retains-failure-report")
 
     @contextmanager
     def forward(self):
@@ -269,87 +217,42 @@ class Regression:
             client.close()
 
     def execute(self):
-        settings, (pvc, job, server) = self.render()
-        self.create(pvc)
-        self.create(job)
-        self.wait_job(self.name + "-data", success=True)
-        generation = self.get("job", self.name + "-data")["spec"]["template"]["spec"]
-        assert generation["volumes"][0]["persistentVolumeClaim"]["claimName"] == settings["PVC_NAME"]
-        pods = json.loads(self.kube("get", "pods", "-l",
-                                   "batch.kubernetes.io/job-name=" + self.name + "-data", "-o", "json").stdout)["items"]
-        assert len(pods) == 1 and pods[0]["status"]["phase"] == "Succeeded"
-        self.kube("logs", pods[0]["metadata"]["name"])
-        transfer = self.transfer(settings, self.name + "-files")
-        generated = self.report(transfer, self.name + "-data")
-        assert generated["errors"] == []
-        assert generated["generated_objects"] == 2 and generated["generated_bytes"] == 128
-        manifest_id = generated["manifest"]["sha256"]
-        assert generated["manifest"]["path"] == "/data/dataset/dataset-manifest.json"
-        self.kube("delete", "job", self.name + "-data", "--wait=true")
-        self.create(server)
-        self.kube("rollout", "status", "statefulset/" + self.name, "--timeout=120s", timeout=130)
-        serving = self.get("statefulset", self.name)["spec"]["template"]["spec"]
-        assert serving["volumes"][0]["persistentVolumeClaim"]["claimName"] == settings["PVC_NAME"]
-        mounts = {m["mountPath"]: m for m in serving["containers"][0]["volumeMounts"]}
-        assert mounts["/usr/share/nginx/html/objects"]["subPath"] == "dataset/objects"
-        assert mounts["/usr/share/nginx/html/objects"]["readOnly"] is True
-        returned = self.kube("exec", transfer, "--", "jq", "-er", ".manifest.path",
-                             "/data/reports/" + self.name + "-data.json").stdout.decode().strip()
-        raw = self.kube("exec", transfer, "--", "cat", returned).stdout
-        assert hashlib.sha256(raw).hexdigest() == manifest_id
-        path = "/fixed-pool-data/dataset-manifest.json"
-        raw = self.kube("exec", self.name + "-0", "--", "cat", path).stdout
-        assert hashlib.sha256(raw).hexdigest() == manifest_id
-        (self.root / "dataset-manifest.json").write_bytes(raw)
+        self.setup()
+        self.create(self.data_job(self.name + '-data'))
+        self.wait_job(self.name + '-data', True)
+        generated = self.report(self.name + '-data')
+        assert generated['errors'] == [] and generated['generated_objects'] == 2
+        files = self.files_pod(self.name + '-files', self.name, '/data')
+        raw = self.kube('exec', files, '--', 'cat', generated['manifest']['path']).stdout
+        assert hashlib.sha256(raw).hexdigest() == generated['manifest']['sha256']
         manifest = json.loads(raw)
+        (self.root / 'dataset-manifest.json').write_bytes(raw)
+        self.create(self.file('server', self.server))
+        self.kube('rollout', 'status', 'statefulset/' + self.name, '--timeout=120s', timeout=130)
         with self.forward() as port:
-            for index, obj in enumerate(manifest["objects"]):
-                object_path = "/" + obj["relative_path"]
-                assert obj["url"] == settings["BASE_URL"] + object_path
-                response, body = self.http(port, object_path)
+            for obj in manifest['objects']:
+                path = '/' + obj['relative_path']
+                response, body = self.http(port, path)
                 assert response.status == 200 and len(body) == 64
-                assert hashlib.sha256(body).hexdigest() == obj["sha256"]
-                generated_body = self.kube("exec", transfer, "--", "cat", "/data/dataset/" + obj["relative_path"]).stdout
-                assert body == generated_body
+                assert hashlib.sha256(body).hexdigest() == obj['sha256']
                 full_body = body
-                response, body = self.http(port, object_path, "HEAD")
-                assert response.status == 200 and response.getheader("Content-Length") == "64" and not body
-                response, body = self.http(port, object_path, headers={"Range": "bytes=0-15"})
-                assert response.status == 206 and response.getheader("Content-Range") == "bytes 0-15/64"
-                assert response.getheader("Content-Length") == "16" and body == full_body[:16]
-                response, _ = self.http(port, "/incorrect-prefix" + object_path)
-                assert response.status == 404
-        self.completed("SRC-01-generated-object-url-head-get-range")
-
-        # Mutate only this run's server: wrong mount must be observed as a failed object GET.
-        patch = {"spec": {"template": {"spec": {"containers": [{"name": "file-server", "volumeMounts": [
-            {"name": "source", "mountPath": "/usr/share/nginx/html/objects", "subPath": "dataset", "readOnly": True}]}]}}}}
-        self.kube("patch", "statefulset", self.name, "--type=strategic", "-p", json.dumps(patch))
-        self.kube("rollout", "status", "statefulset/" + self.name, "--timeout=120s", timeout=130)
-        with self.forward() as port:
-            response, _ = self.http(port, "/objects/sha256/" + manifest["objects"][0]["sha256"])
+                response, body = self.http(port, path, 'HEAD')
+                assert response.status == 200 and response.getheader('Content-Length') == '64' and not body
+                response, body = self.http(port, path, headers={'Range': 'bytes=0-15'})
+                assert response.status == 206 and response.getheader('Content-Range') == 'bytes 0-15/64'
+                assert body == full_body[:16]
+            response, _ = self.http(port, '/objects/sha256/absent')
             assert response.status == 404
-        self.completed("wrong-mount-is-visible")
-        self.kube("apply", "-f", str(server))
-        self.kube("rollout", "status", "statefulset/" + self.name, "--timeout=120s", timeout=130)
-        restored = self.kube("exec", self.name + "-0", "--", "cat", path).stdout
-        assert restored == raw
-        with self.forward() as port:
-            response, body = self.http(port, "/objects/sha256/" + manifest["objects"][0]["sha256"])
-            assert response.status == 200 and hashlib.sha256(body).hexdigest() == manifest["objects"][0]["sha256"]
-        self.completed("restore-without-regeneration")
-
-        # A fresh Job against the nonempty root must fail without publishing a new result.
-        conflict = self.name + "-conflict"
+        self.completed('SRC-01-generated-objects-GET-HEAD-Range')
+        conflict = self.name + '-conflict'
         self.create(self.data_job(conflict))
-        self.wait_job(conflict, success=False)
-        failed = self.report(transfer, conflict)
-        assert failed["manifest"] is None and any(e["code"] == "DATA_CONFLICT" for e in failed["errors"])
-        assert self.report(transfer, self.name + "-data") == generated
-        assert self.kube("exec", self.name + "-0", "--", "cat", path).stdout == raw
-        self.completed("generation-conflict-preserves-dataset")
-        self.report_failures(transfer, generated)
-        self.interrupt_generation()
+        self.wait_job(conflict, False)
+        failed = self.report(conflict)
+        assert failed['manifest'] is None and failed['errors'][0]['code'] == 'DATA_CONFLICT'
+        preserved = self.kube('exec', files, '--', 'cat', generated['manifest']['path']).stdout
+        assert preserved == raw
+        assert b'DATA.root' in (self.root / (conflict + '.log')).read_bytes()
+        self.completed('source-conflict-is-visible-in-log-and-preserves-manifest')
 
     def cleanup(self):
         if not self.created:

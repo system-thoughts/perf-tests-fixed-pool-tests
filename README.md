@@ -8,8 +8,7 @@ perf-tests and run with its standard `testing` package.
 ## Inputs and execution
 
 Obtain tools and worker images built by perf-tests, plus their matching `deploy/`
-material. The directory contains the current YAML templates, env examples and
-deployment helper. Load the images into local Docker before running `delivery.py`.
+material. The directory contains six ordinary editable Kubernetes YAML files. Load the images into local Docker before running `delivery.py`.
 No source archive or deployment archive is required. The tests do not obtain,
 compile or retain the perf-tests source tree, or maintain a second template copy.
 
@@ -58,7 +57,7 @@ the Kubernetes cases below exercise the actual images in Pods. Instrumentation
 adds iteration/VU labels only to temporary copies of delivered scripts.
 
 The first three tests use Python's standard library and bounded local HTTP
-fixtures. `deploy.py` also needs PyYAML and envsubst. A fixture is a protocol peer,
+fixtures. `deploy.py` also needs PyYAML. A fixture is a protocol peer,
 not proof of real Dragonfly behavior or capacity. The image extraction needs
 Docker access; the process tests need `/bin/sh` and executables compatible with
 the host architecture. The extracted binaries/runtime are temporary test inputs,
@@ -129,8 +128,7 @@ is already covered by independent vectors in the unit layer.
 ## Kubernetes cases
 
 Use an existing isolated namespace, usable StorageClass, node and immutable
-candidate tools/worker/FileServer images. `source.py` needs kubectl, envsubst and
-PyYAML. It creates uniquely named resources and deletes only the recorded UIDs.
+candidate tools/worker/FileServer images. `source.py` needs kubectl and PyYAML. It creates uniquely named resources and deletes only the recorded UIDs.
 
 ```bash
 python3 source.py --delivery "$DELIVERY" --work-dir "$WORK_DIR" \
@@ -138,7 +136,7 @@ python3 source.py --delivery "$DELIVERY" --work-dir "$WORK_DIR" \
   --tools-image "$TOOLS_IMAGE" --file-server-image "$FILE_SERVER_IMAGE"
 ```
 
-`preparation.py` also requires a real Seed proxy and its observed instance reference,
+`preparation.py` also requires a real Seed proxy and its expected responding IP,
 a free NodePort, and a source address reachable by that Seed. It tests independent
 metadata copies and worker Jobs. Its placement is caller-selected; one node is
 not reported as a cross-node result.
@@ -149,7 +147,7 @@ python3 preparation.py --delivery "$DELIVERY" --work-dir "$WORK_DIR" \
   --tools-image "$TOOLS_IMAGE" --file-server-image "$FILE_SERVER_IMAGE" \
   --worker-image "$WORKER_IMAGE" --source-base-url "$SOURCE_BASE_URL" \
   --source-node-port "$SOURCE_NODE_PORT" --proxy "$SEED_PROXY" \
-  --expected-server-ip "$SEED_IP" --instance-ref "$SEED_INSTANCE"
+  --expected-server-ip "$SEED_IP"
 ```
 
 It deliberately breaks the origin mount before the first Seed preparation, checks
@@ -170,12 +168,18 @@ inputs, same-path HTTP faults, staggered peers and repeated multi-worker faults.
 Input details stay in Go units; one external case verifies entrypoint wiring.
 Transport resend remains a dependency-upgrade observation, not a required feature
 regression. SL-02 retires the derived report/file checks; RUN and MULTI read native metrics
-and execution facts directly from worker.log. Source/metadata cases remain
-transitional until SL-04 removes those deployment mechanisms.
+and execution facts directly from worker.log. SL-04 consumes ordinary YAML and obtains the manifest using test-owned volume
+access fixtures. It retires rendering, forced-report and report-race checks,
+private FileServer export mounts and large generation cancellation in the source
+walkthrough. Generator cancellation remains in the Go unit layer; the source
+regression still exercises the actual data Job, nonempty-root refusal and Nginx
+GET/HEAD/Range. No manifest HTTP/download feature or dedicated package suite is added.
 Retirement must not drop the retained source-to-Seed-to-worker boundary.
 
-The short catalogue above maps primary risks. Legacy deployment assertions in the
-transitional source/preparation scripts are not counted as additional capabilities.
+The short catalogue above maps primary risks. Deployment structure/security checks remain in deploy.py; source/preparation
+exercise actual images. Temporary volume-access Pods are test fixtures, not
+additional benchmark deliverables. They may also be needed by operators using
+local-volume file transfer; removing product templates does not remove that cost.
 
 ## Results and cleanup
 
@@ -189,3 +193,20 @@ on disk; remove only the selected test work directory when it is no longer neede
 Run relevant cases after changes, and the retained full set before accepting a
 candidate. Main-repo test CI runs Go units independently;
 there is no automatic cross-repository pipeline or publication in this change.
+
+## SL-04 deployment checks and explicit inputs
+
+`deploy.py` reads the delivered YAML directly. It checks Job retry policies,
+applicable security contexts, source/data volume wiring, the shared target
+ConfigMap, worker read-only inputs and writable temporary volume. Shell syntax
+is checked only if inline shell exists. It does not test envsubst, custom name
+validation, a reports-directory convention or the presence of a particular shell
+statement. Kubernetes admission and actual mounts are exercised by the real cases.
+
+`source.py` reads the generated manifest using a test-owned temporary access Pod;
+`preparation.py` copies that selected file to two metadata volumes and invokes the
+independent plan/Seed Jobs. The file transport is fixture setup, not a new product
+helper. Preparation faults verify origin failure, repair without clearing correct
+Seed cache or rebuilding the plan, nonready rejection and two actual worker Jobs
+sharing the target ConfigMap. Output results come from Pod logs; business artifacts
+remain on PVCs. No extra manifest URL, downloader or download-error matrix exists.
