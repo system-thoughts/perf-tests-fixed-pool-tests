@@ -119,6 +119,10 @@ def main():
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--delivery", type=Path, required=True)
     args = parser.parse_args()
+    if read(args.delivery / "delivery.json").get("engine") == "vegeta":
+        from vegeta import multi
+        multi(args)
+        return
     root = args.work_dir.resolve()
     scripts = args.delivery.resolve() / "runtime"
     completed = []

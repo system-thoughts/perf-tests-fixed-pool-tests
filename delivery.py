@@ -56,11 +56,14 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     tools = extract_image(args.tools_image,
                           {'/usr/local/bin/proxy-bench-prepare': 'bin/proxy-bench-prepare'}, output)
-    worker = extract_image(args.worker_image,
-                           {'/usr/bin/k6': 'bin/k6',
-                            '/usr/local/bin/proxy-bench-worker-support': 'bin/proxy-bench-worker-support',
-                            '/home/k6/lib/.': 'lib',
-                            '/home/k6/fixed-pool/.': 'runtime'}, output)
+    entrypoint = json.loads(subprocess.check_output(
+        ['docker', 'image', 'inspect', args.worker_image]))[0]['Config']['Entrypoint']
+    engine = 'vegeta' if entrypoint and 'proxy-bench-worker-support' in entrypoint[0] else 'k6'
+    runtime = {'/usr/local/bin/proxy-bench-worker-support': 'bin/proxy-bench-worker-support',
+               '/home/k6/fixed-pool/.': 'runtime'}
+    if engine == 'k6':
+        runtime.update({'/usr/bin/k6': 'bin/k6', '/home/k6/lib/.': 'lib'})
+    worker = extract_image(args.worker_image, runtime, output)
     for source in sorted(deployment.rglob('*')):
         if source.is_file() and source.suffix == '.yaml':
             target = output / 'deploy' / source.relative_to(deployment)
@@ -68,7 +71,7 @@ def main():
             shutil.copyfile(source, target)
     files = {str(path.relative_to(output)): digest(path)
              for path in sorted(output.rglob('*')) if path.is_file()}
-    value = {'tools_image': tools, 'worker_image': worker,
+    value = {'engine': engine, 'tools_image': tools, 'worker_image': worker,
              'files': files}
     (output / 'delivery.json').write_text(json.dumps(value, indent=2) + '\n')
     print(output)

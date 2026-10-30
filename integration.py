@@ -54,8 +54,8 @@ class Handler(BaseHTTPRequestHandler):
             mode = server.mode
             record = {"url": self.path, "method": "GET", "version": self.request_version,
                       "received_at": time.time(), "range": range_value, "headers": dict(self.headers),
-                      "iteration": self.headers.get("X-Acceptance-Iteration"),
-                      "vu": self.headers.get("X-Acceptance-VU"), "mode": mode}
+                      "iteration": self.headers.get("X-Acceptance-Iteration", self.headers.get("X-Vegeta-Seq")),
+                      "vu": self.headers.get("X-Acceptance-VU", str(self.client_address[1])), "mode": mode}
             server.records.append(record)
         # Hold only the first two iterations until both requests are in flight.
         if mode == "concurrent" and record["iteration"] in ("0", "1"):
@@ -193,6 +193,10 @@ def main():
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--delivery", type=Path, required=True)
     args = parser.parse_args()
+    if read(args.delivery / "delivery.json").get("engine") == "vegeta":
+        from vegeta import single
+        single(args)
+        return
     root = args.work_dir.resolve()
     root.mkdir(parents=True, exist_ok=False)
     record_candidate(args.delivery, root)

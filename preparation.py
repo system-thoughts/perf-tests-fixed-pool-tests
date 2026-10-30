@@ -158,15 +158,22 @@ class Preparation(Regression):
             for prefix, value in records.items():
                 write(self.root / f'worker-{index}-{prefix}.json', value)
             assert records['PROXY_BENCH_FIXED_POOL_WORKER_EXIT_V1']['exit_code'] == 0
-            metrics = records['PROXY_BENCH_FIXED_POOL_K6_SUMMARY_V1']['native_summary']['metrics']
-            assert metrics['http_reqs']['values']['count'] > 0 and metrics['http_req_failed']['values']['rate'] == 0
+            if 'PROXY_BENCH_FIXED_POOL_VEGETA_SUMMARY_V1' in records:
+                summary = records['PROXY_BENCH_FIXED_POOL_VEGETA_SUMMARY_V1']
+                assert summary['native_summary']['requests'] > 0
+                assert summary['expected_status_success_ratio'] == 1
+                assert summary['native_summary']['latencies']['99th'] > 0
+            else:
+                metrics = records['PROXY_BENCH_FIXED_POOL_K6_SUMMARY_V1']['native_summary']['metrics']
+                assert metrics['http_reqs']['values']['count'] > 0 and metrics['http_req_failed']['values']['rate'] == 0
             worker = records['PROXY_BENCH_FIXED_POOL_WORKER_SPEC_V1']
             assert worker['worker_id'] == index and worker['rate'] == 2
             common.append(records['PROXY_BENCH_FIXED_POOL_RUN_SPEC_V1'])
             pod = self.pod_for_job(name)
             assert pod['spec']['securityContext']['runAsUser'] == 1000
             assert pod['spec']['containers'][0]['securityContext']['readOnlyRootFilesystem'] is True
-            assert 'NOT EVALUATED (no thresholds configured)' in raw.decode()
+            if 'PROXY_BENCH_FIXED_POOL_K6_SUMMARY_V1' in records:
+                assert 'NOT EVALUATED (no thresholds configured)' in raw.decode()
         assert common[0] == common[1]
         self.completed('MULTI-01-independent-readonly-volumes-and-shared-target-config')
 

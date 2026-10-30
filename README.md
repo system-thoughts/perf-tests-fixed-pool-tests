@@ -14,7 +14,7 @@ compile or retain the perf-tests source tree, or maintain a second template copy
 
 Development builds are published by the fork's
 [publication workflow](https://github.com/system-thoughts/perf-tests/actions/workflows/publish-fixed-pool.yaml).
-Select a successful run for the candidate commit and download its `fixed-pool-<branch>-<commit>`
+Select a successful run for the candidate commit and download its `fixed-pool-<branch>-<commit>-run-<run-id>-<attempt>`
 artifact. Extract the downloaded artifact, then verify and unpack its deployment bundle:
 
 ```bash
@@ -50,11 +50,14 @@ python3 deploy.py --delivery "$DELIVERY" --work-dir /tmp/fp-deploy-001
 ```
 
 `delivery.py` copies the unified preparation executable from the tools image, and
-k6, worker-support and runtime scripts from the worker image. The controlled
+the worker-support executable and runtime script from the worker image. For k6
+images it also copies k6 and its JS libraries; delivery.json records the engine. The controlled
 process tests execute those delivered files on a compatible Linux host, without
 Go or a separately installed k6. They do not claim to run inside a container;
 the Kubernetes cases below exercise the actual images in Pods. Instrumentation
-adds iteration/VU labels only to temporary copies of delivered scripts.
+adds labels only to temporary copies of delivered scripts or private worker inputs.
+Vegeta tests reuse the existing HTTP fixtures and assert native metrics directly;
+legacy k6 paths remain available for their corresponding images.
 
 The first three tests use Python's standard library and bounded local HTTP
 fixtures. `deploy.py` also needs PyYAML. A fixture is a protocol peer,
@@ -107,10 +110,11 @@ before responses become visible; callback cleanup can outlive a client request.
 | PREP-01-P07 | Persistent loss is bounded; skipped objects identify stop cause | *-reset-persistent.stdout |
 | PREP-01-P08 | Shared timeout bounds backoff; full GET is not retried | transport-result.json |
 
-RUN-01 has normal and dropped variants; their result directories identify the
+RUN-01 has normal and engine-specific overload variants; their result directories identify the
 variant. The PREP protocol fixtures do not replace PREP-01 against a real Seed.
 The normal variant holds the first two requests at a bounded rendezvous and
-requires two distinct VUs and overlapping requests. It parses the four runtime
+requires overlapping requests on distinct connections/workers. k6 additionally
+checks distinct VUs; Vegeta uses its native sequence header and server observations. It parses the four runtime
 log records, checking the run identity, worker/rate, effective options, native
 request count, and raw exit. It does not compare five output files
 field by field. `RUN-01/log-facts.json` records these observations.
