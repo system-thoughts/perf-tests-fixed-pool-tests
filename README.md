@@ -214,3 +214,17 @@ helper. Preparation faults verify origin failure, repair without clearing correc
 Seed cache or rebuilding the plan, nonready rejection and two actual worker Jobs
 sharing the target ConfigMap. Output results come from Pod logs; business artifacts
 remain on PVCs. No extra manifest URL, downloader or download-error matrix exists.
+
+`nydus_hot_dev` uses its legacy three preparation executables, objects-file
+plans and result volume. Its fixed-pool Vegeta image regression is separate:
+
+```bash
+python3 nydus_vegeta.py --work-dir /absolute/new-test-directory \
+  --tools-image <nydus_hot_dev-tools-image> \
+  --worker-image <nydus_hot_dev-worker-image>
+```
+
+This extracts matching executables/scripts, exercises the unchanged preparation
+and shell interface, checks native and normalized archives, and runs a full
+worker container. Docker must be available. The controlled HTTP fixture checks
+functional behavior; it does not measure real Seed or generator capacity.

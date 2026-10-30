@@ -64,12 +64,14 @@ class Handler(BaseHTTPRequestHandler):
                 record["gate_passed"] = True
             except threading.BrokenBarrierError:
                 record["gate_passed"] = False
-        if mode == "slow":
-            time.sleep(0.25)
+        if mode in ("slow", "timeout"):
+            time.sleep(0.4 if mode == "timeout" else 0.25)
         record["responded_at"] = time.time()
         payload = body[start:end + 1]
         if mode == "wrong-status":
             status = 200
+        if mode == "redirect":
+            status = 302
         try:
             self.send_response(status)
             self.send_header("Content-Length", str(len(payload)))
@@ -78,8 +80,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-Dragonfly-Task-Download-Finished", "true")
             if range_value:
                 self.send_header("Content-Range", f"bytes {start}-{end}/{len(body)}")
+            if mode == "redirect":
+                self.send_header("Location", "http://fixture.invalid/must-not-follow")
             self.end_headers()
-            self.wfile.write(payload)
+            if mode == "truncated":
+                self.wfile.write(payload[:len(payload) // 2])
+                self.wfile.flush()
+                self.close_connection = True
+            else:
+                self.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
