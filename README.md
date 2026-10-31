@@ -219,12 +219,13 @@ remain on PVCs. No extra manifest URL, downloader or download-error matrix exist
 plans and result volume. Its fixed-pool Vegeta image regression is separate:
 
 ```bash
-python3 nydus_vegeta.py --work-dir /absolute/new-test-directory \
+sudo python3 nydus_vegeta.py --work-dir /absolute/new-test-directory \
   --tools-image <nydus_hot_dev-tools-image> \
   --worker-image <nydus_hot_dev-worker-image>
 ```
 
 This extracts matching executables/scripts, exercises the unchanged preparation
 and shell interface, checks native and normalized archives, and runs a full
-worker container. Docker must be available. The controlled HTTP fixture checks
+worker container. Docker and permission to assign the new bind mount to the
+image UID are required. The controlled HTTP fixture checks
 functional behavior; it does not measure real Seed or generator capacity.
